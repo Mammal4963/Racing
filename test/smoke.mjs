@@ -1,0 +1,158 @@
+// Two-client smoke test against wrangler dev on :8787.
+import { chromium } from 'playwright';
+
+const BASE = 'http://localhost:8787';
+const fail = (msg) => { console.error('FAIL:', msg); process.exit(1); };
+const ok = (msg) => console.log('ok:', msg);
+
+const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined });
+
+async function newPlayer(name) {
+  const ctx = await browser.newContext({ viewport: { width: 420, height: 800 } });
+  const page = await ctx.newPage();
+  page.on('console', (m) => { if (m.type() === 'error') console.log(`[${name} console.error]`, m.text()); });
+  page.on('pageerror', (e) => { console.log(`[${name} pageerror]`, e.message); fail('page error'); });
+  await page.goto(BASE);
+  await page.fill('#nameInput', name);
+  return page;
+}
+
+// --- Player 1 creates a room
+const p1 = await newPlayer('Alice');
+await p1.click('#createBtn');
+await p1.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
+const code = (await p1.textContent('#roomCode')).trim();
+if (!/^[A-Z0-9]{4}$/.test(code)) fail(`bad room code: ${code}`);
+ok(`room created: ${code}`);
+
+// --- Player 2 joins via code
+const p2 = await newPlayer('Bob');
+await p2.fill('#codeInput', code);
+await p2.click('#joinBtn');
+await p2.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
+ok('player 2 joined lobby');
+
+// Both lobbies should list 2 players; p1 is host and sees the start button.
+await p1.waitForFunction(() => document.querySelectorAll('#playerList li').length === 2, null, { timeout: 5000 });
+await p2.waitForFunction(() => document.querySelectorAll('#playerList li').length === 2, null, { timeout: 5000 });
+ok('both lobbies show 2 players');
+if (await p1.$eval('#startBtn', (el) => el.classList.contains('hidden'))) fail('host missing start button');
+if (!(await p2.$eval('#startBtn', (el) => el.classList.contains('hidden')))) fail('non-host sees start button');
+ok('host/non-host UI correct');
+
+// --- Start the race
+await p1.click('#startBtn');
+await p1.waitForFunction(() => window.__game.phase === 'racing', null, { timeout: 5000 });
+await p2.waitForFunction(() => window.__game.phase === 'racing', null, { timeout: 5000 });
+ok('both clients entered racing phase');
+
+// Countdown text visible
+const cd = await p1.textContent('#countdown');
+ok(`countdown showing: "${cd.trim()}"`);
+
+// --- Wait out the countdown, hold no keys: auto-accelerate should move cars.
+await p1.waitForFunction(() => performance.now() > window.__game.race.startAt + 500, null, { timeout: 8000 });
+const start1 = await p1.evaluate(() => ({ x: window.__game.race.car.x, y: window.__game.race.car.y }));
+await p1.waitForTimeout(1500);
+const now1 = await p1.evaluate(() => ({ x: window.__game.race.car.x, y: window.__game.race.car.y, speed: window.__game.race.car.speed }));
+const moved = Math.hypot(now1.x - start1.x, now1.y - start1.y);
+if (moved < 50) fail(`car 1 barely moved (${moved.toFixed(1)}px)`);
+ok(`car 1 auto-drives (moved ${moved.toFixed(0)}px, speed ${now1.speed.toFixed(0)})`);
+
+// --- p2 should be receiving p1's position packets and interpolating them
+const snaps = await p2.evaluate(() => {
+  const remotes = [...window.__game.remotes.values()];
+  return remotes.map((r) => r.snaps.length);
+});
+if (!snaps.length || snaps[0] < 2) fail(`p2 has no snapshots of p1: ${JSON.stringify(snaps)}`);
+ok(`p2 receives p1 position packets (${snaps[0]} buffered)`);
+
+// p2's view of p1's car should be near p1's actual position (within ~200 world units, given 130ms delay)
+const p1pos = await p1.evaluate(() => ({ x: window.__game.race.car.x, y: window.__game.race.car.y }));
+const p2sees = await p2.evaluate(() => {
+  const r = [...window.__game.remotes.values()][0];
+  const s = r.snaps[r.snaps.length - 1];
+  return { x: s.x, y: s.y };
+});
+const err = Math.hypot(p1pos.x - p2sees.x, p1pos.y - p2sees.y);
+if (err > 250) fail(`replication error too big: ${err.toFixed(0)}`);
+ok(`replication position error: ${err.toFixed(0)} world units`);
+
+// --- Keyboard steering changes heading on p1
+const h0 = await p1.evaluate(() => window.__game.race.car.heading);
+await p1.keyboard.down('ArrowLeft');
+await p1.waitForTimeout(500);
+await p1.keyboard.up('ArrowLeft');
+const h1 = await p1.evaluate(() => window.__game.race.car.heading);
+if (Math.abs(h1 - h0) < 0.15) fail(`steering had no effect (dh=${(h1 - h0).toFixed(3)})`);
+ok(`steering works (heading changed ${(h1 - h0).toFixed(2)} rad)`);
+
+// --- Touch input: tap-and-hold right zone steers right
+const h2 = await p1.evaluate(() => window.__game.race.car.heading);
+await p1.evaluate(() => {
+  // simulate a held touch in the right steering zone via the same handler path
+  const ev = new TouchEvent('touchstart', {
+    touches: [new Touch({ identifier: 1, target: document.getElementById('game'), clientX: window.innerWidth * 0.9, clientY: 700 })],
+    bubbles: true, cancelable: true,
+  });
+  document.getElementById('game').dispatchEvent(ev);
+});
+await p1.waitForTimeout(400);
+const h3 = await p1.evaluate(() => window.__game.race.car.heading);
+await p1.evaluate(() => {
+  const ev = new TouchEvent('touchend', { touches: [], bubbles: true, cancelable: true });
+  document.getElementById('game').dispatchEvent(ev);
+});
+if (h3 - h2 < 0.1) fail(`touch steer had no effect (dh=${(h3 - h2).toFixed(3)})`);
+ok(`touch steering works (dh=${(h3 - h2).toFixed(2)} rad)`);
+
+// --- Fast-forward a race end: teleport p1 around the track by feeding laps
+// (drive the real lap-counting path by warping the car forward along the centerline)
+for (const page of [p1, p2]) {
+  await page.evaluate(async () => {
+    const { pointAt } = await import('/js/track.js');
+    const g = window.__game;
+    // advance in 120-unit hops so progressDelta stays wrap-safe
+    const hop = () => {
+      const cur = g.race.lastS;
+      const p = pointAt(cur + 120);
+      g.race.car.x = p.x; g.race.car.y = p.y;
+      g.race.car.heading = p.ang; g.race.car.travel = p.ang;
+      g.race.car.speed = 200;
+    };
+    window.__hop = hop;
+  });
+}
+// hop both cars until both finish
+for (let i = 0; i < 200; i++) {
+  await p1.evaluate(() => window.__hop());
+  await p2.evaluate(() => window.__hop());
+  await p1.waitForTimeout(35);
+  const done = await p1.evaluate(() => window.__game.phase === 'results');
+  const done2 = await p2.evaluate(() => window.__game.phase === 'results');
+  if (done && done2) break;
+}
+const res1 = await p1.evaluate(() => window.__game.phase);
+const res2 = await p2.evaluate(() => window.__game.phase);
+if (res1 !== 'results' || res2 !== 'results') fail(`race did not end: p1=${res1} p2=${res2}`);
+ok('race completed → results phase on both clients');
+
+const rows = await p1.$$eval('#resultRows tr', (trs) => trs.map((tr) => tr.textContent.trim()));
+if (rows.length !== 2) fail(`expected 2 result rows, got ${rows.length}: ${rows}`);
+ok(`results table: ${JSON.stringify(rows)}`);
+
+// --- Host resets to lobby
+await p1.click('#againBtn');
+await p1.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
+await p2.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
+ok('race again returns both clients to lobby');
+
+// --- Screenshot for the human
+await p1.click('#startBtn');
+await p1.waitForFunction(() => window.__game.phase === 'racing' && performance.now() > window.__game.race.startAt + 1500, null, { timeout: 10000 });
+await p1.screenshot({ path: new URL('./race.png', import.meta.url).pathname });
+ok('screenshot saved');
+
+await browser.close();
+console.log('\nALL SMOKE TESTS PASSED');
+process.exit(0);

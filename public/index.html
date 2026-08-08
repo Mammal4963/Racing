@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Slipstream — browser racing</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏎️</text></svg>">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100dvh; overflow: hidden; background: #14161c; color: #eceef2;
+    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+    overscroll-behavior: none;
+  }
+  #game { position: fixed; inset: 0; width: 100vw; height: 100dvh; display: block; }
+  .hidden { display: none !important; }
+
+  .screen {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; padding: 24px;
+    background: radial-gradient(120% 100% at 50% 0%, #1d2230 0%, #14161c 70%);
+    z-index: 10; text-align: center;
+  }
+  h1 { font-size: clamp(34px, 9vw, 56px); letter-spacing: 3px; font-style: italic; }
+  h1 em { color: #ffd740; font-style: italic; }
+  .sub { color: #9aa1b0; margin-bottom: 10px; font-size: 15px; }
+  input {
+    width: min(320px, 84vw); padding: 14px 16px; font-size: 17px; border-radius: 12px;
+    border: 1px solid #343b4d; background: #1c202b; color: #eceef2; text-align: center;
+    outline: none;
+  }
+  input:focus { border-color: #ffd740; }
+  button {
+    width: min(320px, 84vw); padding: 15px 16px; font-size: 17px; font-weight: 700;
+    border: none; border-radius: 12px; background: #ffd740; color: #191505;
+    cursor: pointer; touch-action: manipulation;
+  }
+  button.secondary { background: #2a3040; color: #eceef2; }
+  button:active { transform: scale(0.97); }
+  .row { display: flex; gap: 8px; width: min(320px, 84vw); }
+  .row input { flex: 1; width: auto; text-transform: uppercase; }
+  .row button { width: auto; padding: 15px 22px; }
+  .divider { color: #565e70; font-size: 13px; letter-spacing: 2px; }
+
+  #roomCode { font-size: 44px; letter-spacing: 10px; font-weight: 800; color: #ffd740; }
+  #playerList { list-style: none; display: flex; flex-direction: column; gap: 8px; min-height: 60px; }
+  #playerList li { font-size: 18px; display: flex; align-items: center; gap: 8px; justify-content: center; }
+  .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; }
+  .tag {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #9aa1b0;
+    border: 1px solid #343b4d; padding: 2px 7px; border-radius: 99px;
+  }
+  .wait { color: #9aa1b0; font-size: 15px; }
+
+  /* HUD */
+  #hud { position: fixed; inset: 0; pointer-events: none; z-index: 5; }
+  #lapText, #posText {
+    position: fixed; top: calc(10px + env(safe-area-inset-top)); font-weight: 800;
+    font-size: 20px; text-shadow: 0 2px 6px rgba(0,0,0,0.7);
+  }
+  #lapText { left: 14px; }
+  #posText { left: 14px; top: calc(38px + env(safe-area-inset-top)); color: #ffd740; }
+  #standings {
+    position: fixed; top: calc(10px + env(safe-area-inset-top)); right: 10px;
+    display: flex; flex-direction: column; gap: 3px; font-size: 13px;
+    background: rgba(10,12,18,0.55); border-radius: 10px; padding: 8px 10px;
+    min-width: 130px;
+  }
+  .standing { display: flex; align-items: center; gap: 6px; }
+  .standing.me { color: #ffd740; font-weight: 700; }
+  .standing .pos { width: 14px; text-align: right; opacity: 0.7; }
+  .standing .sname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90px; }
+  #countdown {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-size: clamp(70px, 22vw, 150px); font-weight: 900; font-style: italic;
+    color: #ffd740; text-shadow: 0 4px 24px rgba(0,0,0,0.6);
+  }
+  #banner, #wrongWay {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    top: calc(14px + env(safe-area-inset-top));
+    background: rgba(10,12,18,0.7); padding: 8px 18px; border-radius: 99px;
+    font-weight: 700; font-size: 15px;
+  }
+  #wrongWay { top: auto; bottom: 30dvh; color: #ff5252; font-size: 22px; }
+
+  .zone {
+    position: fixed; bottom: 0; height: 34dvh; opacity: 0;
+    transition: opacity 0.12s; display: flex; align-items: flex-end;
+    justify-content: center; padding-bottom: calc(26px + env(safe-area-inset-bottom));
+    font-size: 34px; color: #fff;
+  }
+  .zone.active { opacity: 0.25; background: linear-gradient(to top, rgba(255,255,255,0.35), transparent); }
+  #zoneL { left: 0; width: 42vw; }
+  #zoneR { right: 0; width: 42vw; }
+  #zoneB { left: 42vw; width: 16vw; font-size: 20px; }
+  .hint {
+    position: fixed; bottom: calc(10px + env(safe-area-inset-bottom)); width: 100%;
+    text-align: center; color: rgba(236,238,242,0.5); font-size: 12px;
+  }
+
+  /* Results */
+  #results table { border-collapse: collapse; font-size: 17px; }
+  #results td { padding: 7px 14px; text-align: left; }
+  #results tr.me td { color: #ffd740; font-weight: 700; }
+  #results td:last-child { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="hud" class="hidden">
+  <div id="lapText">LAP 1/3</div>
+  <div id="posText">P1</div>
+  <div id="standings"></div>
+  <div id="countdown" class="hidden"></div>
+  <div id="banner" class="hidden"></div>
+  <div id="wrongWay" class="hidden">WRONG WAY!</div>
+  <div class="zone" id="zoneL">◀</div>
+  <div class="zone" id="zoneB">BRAKE</div>
+  <div class="zone" id="zoneR">▶</div>
+  <div class="hint">hold left / right to steer · middle to brake · gas is automatic</div>
+</div>
+
+<div id="menu" class="screen">
+  <h1>SLIP<em>STREAM</em></h1>
+  <div class="sub">multiplayer racing in your browser</div>
+  <input id="nameInput" maxlength="12" placeholder="Your name" autocomplete="off">
+  <button id="createBtn">Create race</button>
+  <div class="divider">— OR —</div>
+  <div class="row">
+    <input id="codeInput" maxlength="8" placeholder="ROOM CODE" autocomplete="off" autocapitalize="characters">
+    <button id="joinBtn" class="secondary">Join</button>
+  </div>
+</div>
+
+<div id="lobby" class="screen hidden">
+  <div class="sub">room code</div>
+  <div id="roomCode"></div>
+  <button id="shareBtn" class="secondary">Share link</button>
+  <ul id="playerList"></ul>
+  <button id="startBtn" class="hidden">Start race · 3 laps</button>
+  <div id="waitMsg" class="wait">Waiting for the host to start…</div>
+</div>
+
+<div id="results" class="screen hidden">
+  <h1>RESULTS</h1>
+  <table><tbody id="resultRows"></tbody></table>
+  <button id="againBtn" class="hidden">Race again</button>
+  <div id="againWait" class="wait">Waiting for the host…</div>
+</div>
+
+<div id="disconnected" class="screen hidden">
+  <h1>DISCONNECTED</h1>
+  <div class="sub">The connection to the race server dropped.</div>
+  <button id="reloadBtn">Rejoin</button>
+</div>
+
+<script type="module" src="/js/main.js"></script>
+</body>
+</html>
