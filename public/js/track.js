@@ -56,13 +56,28 @@ function buildTrack() {
 
 export const TRACK = buildTrack();
 
-// Closest point on the centerline. Returns arc position `s` in [0, length)
-// and perpendicular distance `d` (d > HALF_WIDTH means off the asphalt).
-export function project(x, y) {
+const PROJECT_WINDOW = 420; // arc units searched either side of a hint
+
+const wrapS = (s) => ((s % TRACK.length) + TRACK.length) % TRACK.length;
+
+// Index of the centerline segment containing arc position s (s pre-wrapped).
+function segIndexAt(s) {
+  const { pts, cum } = TRACK;
+  let lo = 0, hi = pts.length;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (cum[mid] <= s) lo = mid; else hi = mid;
+  }
+  return lo;
+}
+
+// Closest point over `count` segments starting at `first` (wraps).
+function scan(x, y, first, count) {
   const { pts, cum, length } = TRACK;
   const m = pts.length;
   let bestD2 = Infinity, bestS = 0;
-  for (let i = 0; i < m; i++) {
+  for (let k = 0; k < count; k++) {
+    const i = (first + k) % m;
     const a = pts[i];
     const b = pts[(i + 1) % m];
     const abx = b[0] - a[0], aby = b[1] - a[1];
@@ -80,16 +95,36 @@ export function project(x, y) {
   return { s: bestS, d: Math.sqrt(bestD2) };
 }
 
+// Closest point on the centerline. Returns arc position `s` in [0, length)
+// and perpendicular distance `d` (d > HALF_WIDTH means off the asphalt).
+//
+// Pass `hintS` — the caller's previous `s` — to search only the stretch of
+// track around it. That is both cheaper than sweeping the whole circuit every
+// frame and more correct: a car can never snap onto a different part of the
+// lap that happens to run close by, which would hand it a chunk of free
+// progress. If the car turns out to be nowhere near that stretch the search
+// widens to the full track.
+export function project(x, y, hintS) {
+  const { pts, cum } = TRACK;
+  const m = pts.length;
+  if (hintS == null) return scan(x, y, 0, m);
+  const first = segIndexAt(wrapS(hintS - PROJECT_WINDOW));
+  let count = 0, arc = 0;
+  while (arc < PROJECT_WINDOW * 2 && count < m) {
+    const i = (first + count) % m;
+    arc += cum[i + 1] - cum[i];
+    count++;
+  }
+  const near = scan(x, y, first, count);
+  return near.d > PROJECT_WINDOW ? scan(x, y, 0, m) : near;
+}
+
 // Point + tangent angle at arc position s.
 export function pointAt(s) {
-  const { pts, cum, length } = TRACK;
+  const { pts, cum } = TRACK;
   const m = pts.length;
-  s = ((s % length) + length) % length;
-  let lo = 0, hi = m;
-  while (lo < hi - 1) {
-    const mid = (lo + hi) >> 1;
-    if (cum[mid] <= s) lo = mid; else hi = mid;
-  }
+  s = wrapS(s);
+  const lo = segIndexAt(s);
   const a = pts[lo];
   const b = pts[(lo + 1) % m];
   const segLen = cum[lo + 1] - cum[lo] || 1e-9;

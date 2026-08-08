@@ -12,10 +12,22 @@ export const PALETTE = [
 
 const WORLD_MARGIN = 260;
 
+// Skid marks: a capped ring of short segments that fade out. They are drawn
+// live rather than baked into a second world-sized canvas — one 19MB layer is
+// enough for a phone — and batched into a handful of paths by opacity so the
+// whole trail costs a few strokes per frame instead of one per mark.
+const SKID_LIFE_MS = 4200;
+const SKID_MAX = 800;
+const SKID_STEP_MS = 30; // how often one car lays down a new pair of marks
+const SKID_BUCKETS = 4;
+
 export class Renderer {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
+    this.marks = [];
+    this.skidAt = new Map(); // car id -> last emit time
+    this.skidPrev = new Map(); // `id:side` -> last wheel position
     const b = TRACK.bounds;
     this.world = {
       x: b.minX - WORLD_MARGIN,
@@ -94,8 +106,55 @@ export class Renderer {
     return c;
   }
 
+  clearSkids() {
+    this.marks.length = 0;
+    this.skidAt.clear();
+    this.skidPrev.clear();
+  }
+
+  // Lay rubber under one car's rear wheels. `strength` is 0..1.
+  skid(id, x, y, heading, now, strength) {
+    if (now - (this.skidAt.get(id) || 0) < SKID_STEP_MS) return;
+    this.skidAt.set(id, now);
+    const cos = Math.cos(heading), sin = Math.sin(heading);
+    const bx = x - cos * CAR.LEN * 0.3, by = y - sin * CAR.LEN * 0.3;
+    const ox = -sin * (CAR.WID / 2 - 1), oy = cos * (CAR.WID / 2 - 1);
+    for (const side of [-1, 1]) {
+      const px = bx + ox * side, py = by + oy * side;
+      const key = `${id}:${side}`;
+      const prev = this.skidPrev.get(key);
+      this.skidPrev.set(key, { x: px, y: py, t: now });
+      if (!prev || now - prev.t > 140) continue; // trail broken — start fresh
+      const d2 = (px - prev.x) ** 2 + (py - prev.y) ** 2;
+      if (d2 < 1 || d2 > 8100) continue; // stationary, or a teleport/respawn
+      this.marks.push({
+        x1: prev.x, y1: prev.y, x2: px, y2: py, born: now, s: strength,
+      });
+    }
+    while (this.marks.length > SKID_MAX) this.marks.shift();
+  }
+
+  drawSkids(ctx, now) {
+    const marks = this.marks;
+    while (marks.length && now - marks[0].born > SKID_LIFE_MS) marks.shift();
+    if (!marks.length) return;
+    const paths = Array.from({ length: SKID_BUCKETS }, () => new Path2D());
+    for (const m of marks) {
+      const life = 1 - (now - m.born) / SKID_LIFE_MS;
+      const b = Math.max(0, Math.min(SKID_BUCKETS - 1, (life * m.s * SKID_BUCKETS) | 0));
+      paths[b].moveTo(m.x1, m.y1);
+      paths[b].lineTo(m.x2, m.y2);
+    }
+    ctx.lineCap = 'round';
+    ctx.lineWidth = 4;
+    for (let b = 0; b < SKID_BUCKETS; b++) {
+      ctx.strokeStyle = `rgba(22,20,24,${0.06 + b * 0.055})`;
+      ctx.stroke(paths[b]);
+    }
+  }
+
   // cars: [{x, y, heading, color, name, braking, isMe}]
-  draw(camX, camY, cars) {
+  draw(camX, camY, cars, now) {
     const { ctx, dpr, zoom } = this;
     const vw = this.cssW, vh = this.cssH;
 
@@ -114,6 +173,7 @@ export class Renderer {
     ctx.translate(-camX, -camY);
     ctx.imageSmoothingEnabled = true;
     ctx.drawImage(this.static, this.world.x, this.world.y);
+    this.drawSkids(ctx, now);
 
     for (const car of cars) this.drawCar(ctx, car);
 
