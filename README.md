@@ -84,9 +84,15 @@ plan works since the Room class uses SQLite-backed storage.
 
 | | Steer | Brake / drift | Gas |
 | --- | --- | --- | --- |
-| Phone | hold left / right side of screen | hold middle | automatic |
-| Keyboard | ← → or A D | ↓ / S / Space | automatic |
+| Phone | hold either half of the screen | add your other thumb | automatic |
+| Keyboard | ← → or A D | hold both, or ↓ / S / Space | automatic |
+
+The screen is two halves and that's it. Hold one side to steer; while you're
+turning, put your other thumb down and the car brakes and the tail steps out.
+The drift always goes the way you were *already* steering, so the second thumb
+never fights the first — let it go and you're back to a clean turn.
 
 Braking in a straight line is a real anchor. Braking *while turning* is a
 handbrake: it barely scrubs speed, swings the tail out, turns about 60% tighter
-than a grip corner, and fills the turbo meter. That is the whole game.
+than a grip corner, and fills the turbo meter. That is the whole game. (Grab
+both sides from neutral and you get the straight-line anchor instead.)

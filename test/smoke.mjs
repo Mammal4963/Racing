@@ -106,6 +106,41 @@ await p1.evaluate(() => {
 if (h3 - h2 < 0.1) fail(`touch steer had no effect (dh=${(h3 - h2).toFixed(3)})`);
 ok(`touch steering works (dh=${(h3 - h2).toFixed(2)} rad)`);
 
+// --- Touch drift gesture: holding the far side while steering should brake
+// and keep steering the way you already were, not cancel the turn.
+const touchAt = (ids) => `
+  const el = document.getElementById('game');
+  const t = ${JSON.stringify(ids)}.map(([id, fx]) =>
+    new Touch({ identifier: id, target: el, clientX: window.innerWidth * fx, clientY: 700 }));
+  el.dispatchEvent(new TouchEvent('touchstart', { touches: t, bubbles: true, cancelable: true }));
+`;
+await p1.evaluate(new Function(touchAt([[1, 0.85]])));
+await p1.waitForTimeout(160); // well past the "pressed together" window
+const oneSide = await p1.evaluate(() => ({ ...window.__input }));
+if (oneSide.steer !== 1 || oneSide.brake) fail(`one side should steer only: ${JSON.stringify(oneSide)}`);
+
+await p1.evaluate(new Function(touchAt([[1, 0.85], [2, 0.15]])));
+await p1.waitForTimeout(60);
+const bothSides = await p1.evaluate(() => ({
+  ...window.__input,
+  lit: document.querySelectorAll('.zone.drift').length,
+}));
+if (!bothSides.brake) fail(`adding the far thumb should brake: ${JSON.stringify(bothSides)}`);
+if (bothSides.steer !== 1) fail(`drift should keep steering right, got ${JSON.stringify(bothSides)}`);
+if (bothSides.lit !== 2) fail(`expected both zones lit for the drift, got ${bothSides.lit}`);
+ok('far-side touch brakes and drifts in the direction already steered');
+
+// Both grabbed at once from neutral is a straight-line stop, not a drift.
+await p1.evaluate(() => document.getElementById('game')
+  .dispatchEvent(new TouchEvent('touchend', { touches: [], bubbles: true, cancelable: true })));
+await p1.evaluate(new Function(touchAt([[1, 0.85], [2, 0.15]])));
+await p1.waitForTimeout(60);
+const together = await p1.evaluate(() => ({ ...window.__input }));
+if (!together.brake || together.steer !== 0) fail(`both at once should brake straight: ${JSON.stringify(together)}`);
+ok('both sides grabbed together brakes in a straight line');
+await p1.evaluate(() => document.getElementById('game')
+  .dispatchEvent(new TouchEvent('touchend', { touches: [], bubbles: true, cancelable: true })));
+
 // --- Drifting: braking while steering should charge the boost meter, and the
 // HUD bar should follow it.
 if (!(await p1.$eval('#lights', (el) => el.classList.contains('hidden')))) {

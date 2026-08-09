@@ -155,9 +155,10 @@
     font-size: 34px; color: #fff;
   }
   .zone.active { opacity: 0.25; background: linear-gradient(to top, rgba(255,255,255,0.35), transparent); }
-  #zoneL { left: 0; width: 42vw; }
-  #zoneR { right: 0; width: 42vw; }
-  #zoneB { left: 42vw; width: 16vw; font-size: 20px; }
+  /* Both sides held = brake and drift. */
+  .zone.drift { opacity: 0.42; background: linear-gradient(to top, rgba(255,171,64,0.55), transparent); }
+  #zoneL { left: 0; width: 50vw; }
+  #zoneR { right: 0; width: 50vw; }
   .hint {
     position: fixed; bottom: calc(10px + env(safe-area-inset-bottom)); width: 100%;
     text-align: center; color: rgba(236,238,242,0.5); font-size: 12px;
@@ -222,9 +223,8 @@
     <div class="cap" id="boostCap">drift to charge</div>
   </div>
   <div class="zone" id="zoneL">◀</div>
-  <div class="zone" id="zoneB">BRAKE</div>
   <div class="zone" id="zoneR">▶</div>
-  <div class="hint">hold left / right to steer · middle to brake &amp; drift</div>
+  <div class="hint">hold a side to steer · add the other thumb to drift</div>
 </div>
 
 <div id="menu" class="screen">

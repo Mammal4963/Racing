@@ -774,20 +774,49 @@ requestAnimationFrame(frame);
 
 // -------------------------------------------------------------------- input
 
+// Two controls, one per side. Hold a side to steer that way; add the other
+// thumb to brake — and because braking mid-turn is a handbrake, that is how
+// you drift. The slide goes the way you were already steering, so the second
+// thumb never fights the first. Grabbing both from neutral is a straight stop.
+const SIMUL_MS = 90; // pressed closer together than this counts as "together"
+
+function resolveSides(l, r, lAt, rAt) {
+  if (l === r) {
+    if (!l) return { steer: 0, brake: false };
+    // Both held: keep steering the way the first thumb asked for.
+    const gap = lAt - rAt;
+    return { steer: Math.abs(gap) < SIMUL_MS ? 0 : gap < 0 ? -1 : 1, brake: true };
+  }
+  return { steer: r ? 1 : -1, brake: false };
+}
+
 const keys = new Set();
 const KEY_LEFT = ['ArrowLeft', 'KeyA'];
 const KEY_RIGHT = ['ArrowRight', 'KeyD'];
 const KEY_BRAKE = ['ArrowDown', 'KeyS', 'Space'];
 
+let keySteer = 0, keyBrake = false;
+let touchSteer = 0, touchBrake = false;
+const heldAt = { keyL: 0, keyR: 0, touchL: 0, touchR: 0 };
+const held = { keyL: false, keyR: false, touchL: false, touchR: false };
+
+// Stamp the moment a side goes from released to held, so we know which came
+// first when both end up down.
+function stamp(side, on) {
+  if (on && !held[side]) heldAt[side] = performance.now();
+  held[side] = on;
+}
+
 function updateKeyInput() {
   const l = KEY_LEFT.some((k) => keys.has(k));
   const r = KEY_RIGHT.some((k) => keys.has(k));
-  keySteer = (r ? 1 : 0) - (l ? 1 : 0);
-  keyBrake = KEY_BRAKE.some((k) => keys.has(k));
+  stamp('keyL', l);
+  stamp('keyR', r);
+  const sides = resolveSides(l, r, heldAt.keyL, heldAt.keyR);
+  keySteer = sides.steer;
+  keyBrake = sides.brake || KEY_BRAKE.some((k) => keys.has(k));
   mergeInput();
 }
-let keySteer = 0, keyBrake = false;
-let touchSteer = 0, touchBrake = false;
 
 function mergeInput() {
   input.steer = Math.max(-1, Math.min(1, keySteer + touchSteer));
@@ -811,21 +840,23 @@ window.addEventListener('blur', () => {
   updateKeyInput();
 });
 
-// Touch: left/right edge zones steer, middle zone brakes. Auto-accelerate.
+// Touch: the screen is two halves. Hold one to steer, add the other to drift.
 function readTouches(touches) {
-  let l = false, r = false, b = false;
+  let l = false, r = false;
   for (const t of touches) {
-    const fx = t.clientX / window.innerWidth;
-    if (fx < 0.42) l = true;
-    else if (fx > 0.58) r = true;
-    else b = true;
+    if (t.clientX / window.innerWidth < 0.5) l = true;
+    else r = true;
   }
-  touchSteer = (r ? 1 : 0) - (l ? 1 : 0);
-  touchBrake = b;
+  stamp('touchL', l);
+  stamp('touchR', r);
+  const sides = resolveSides(l, r, heldAt.touchL, heldAt.touchR);
+  touchSteer = sides.steer;
+  touchBrake = sides.brake;
   mergeInput();
   $('zoneL').classList.toggle('active', l);
   $('zoneR').classList.toggle('active', r);
-  $('zoneB').classList.toggle('active', b);
+  $('zoneL').classList.toggle('drift', sides.brake);
+  $('zoneR').classList.toggle('drift', sides.brake);
 }
 for (const ev of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) {
   canvas.addEventListener(ev, (e) => { e.preventDefault(); readTouches(e.touches); }, { passive: false });
@@ -888,5 +919,6 @@ if (urlCode && /^[A-Za-z0-9]{4,8}$/.test(urlCode)) {
 }
 showScreen('menu');
 
-// Debug handle for automated tests.
+// Debug handles for automated tests.
 window.__game = G;
+window.__input = input;
