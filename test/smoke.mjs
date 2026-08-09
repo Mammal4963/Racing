@@ -106,6 +106,44 @@ await p1.evaluate(() => {
 if (h3 - h2 < 0.1) fail(`touch steer had no effect (dh=${(h3 - h2).toFixed(3)})`);
 ok(`touch steering works (dh=${(h3 - h2).toFixed(2)} rad)`);
 
+// --- Reconnect: drop p2's socket mid-race. It should climb back into the same
+// car (same id, same lap) instead of dead-ending on the disconnect screen.
+const p2id = await p2.evaluate(() => window.__game.myId);
+await p2.evaluate(() => window.__game.net.ws.close());
+await p2.waitForFunction(() => window.__game.net.online, null, { timeout: 15000 });
+await p2.waitForTimeout(300);
+const back = await p2.evaluate(() => ({
+  id: window.__game.myId,
+  phase: window.__game.phase,
+  spectating: window.__game.spectating,
+  hasCar: !!window.__game.race?.car,
+}));
+if (back.id !== p2id) fail(`resume handed out a new identity: ${p2id} -> ${back.id}`);
+if (back.phase !== 'racing' || back.spectating || !back.hasCar) {
+  fail(`p2 did not resume racing: ${JSON.stringify(back)}`);
+}
+ok('p2 dropped its socket and resumed the same car mid-race');
+
+// p1 must re-establish p2 as a remote car, not leave a hole in the grid.
+await p1.waitForFunction(
+  (id) => window.__game.remotes.get(id)?.snaps.length > 0,
+  p2id,
+  { timeout: 10000 }
+);
+ok('p1 picked p2 back up after the reconnect');
+
+// --- A phone joining mid-race spectates, and must not hold the race open:
+// the room ends on the racers who lined up, not on everyone connected.
+const p3 = await newPlayer('Carol');
+await p3.fill('#codeInput', code);
+await p3.click('#joinBtn');
+await p3.waitForFunction(
+  () => window.__game.phase === 'racing' && window.__game.spectating,
+  null,
+  { timeout: 8000 }
+);
+ok('late joiner spectates the race in progress');
+
 // --- Fast-forward a race end: teleport p1 around the track by feeding laps
 // (drive the real lap-counting path by warping the car forward along the centerline)
 for (const page of [p1, p2]) {
@@ -139,7 +177,13 @@ ok('race completed → results phase on both clients');
 
 const rows = await p1.$$eval('#resultRows tr', (trs) => trs.map((tr) => tr.textContent.trim()));
 if (rows.length !== 2) fail(`expected 2 result rows, got ${rows.length}: ${rows}`);
+if (rows.some((r) => r.includes('DNF'))) fail(`spectator scored as DNF: ${rows}`);
 ok(`results table: ${JSON.stringify(rows)}`);
+
+// Every finisher should have a best-lap time next to its total.
+const bests = await p1.$$eval('#resultRows tr td:nth-child(4)', (tds) => tds.map((td) => td.textContent.trim()));
+if (bests.some((b) => !/^\d+:\d\d\.\d\d$/.test(b))) fail(`missing best-lap times: ${JSON.stringify(bests)}`);
+ok(`best-lap column: ${JSON.stringify(bests)}`);
 
 // --- Host resets to lobby
 await p1.click('#againBtn');

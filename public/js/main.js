@@ -6,6 +6,10 @@ import { Renderer, PALETTE } from './render.js';
 const LAPS = 3;
 const SEND_INTERVAL_MS = 66; // ~15 position packets/sec
 const INTERP_DELAY_MS = 130; // render remote cars slightly in the past
+const CAM_LEAD_S = 0.26; // camera looks this far up the road
+const CAM_SMOOTH = 7; // camera catch-up rate; higher is tighter
+const HUD_INTERVAL_MS = 60;
+const SKID_SLIP = 0.22; // radians of slide before the tyres start marking
 
 const $ = (id) => document.getElementById(id);
 const screens = { menu: $('menu'), lobby: $('lobby'), results: $('results'), disc: $('disconnected') };
@@ -23,11 +27,14 @@ const G = {
   phase: 'menu', // menu | lobby | racing | results
   spectating: false,
   players: new Map(), // id -> {id, name, color, order, lap?, finishMs?}
-  remotes: new Map(), // id -> {snaps: [{t,x,y,h}]}
+  remotes: new Map(), // id -> {snaps: [{t,x,y,h}], lastS}
   race: null,
+  results: null,
+  cam: { x: 0, y: 0 },
 };
 
 const input = { steer: 0, brake: false };
+const PARKED = { steer: 0, brake: true };
 
 // ---------------------------------------------------------------- menu / net
 
@@ -41,30 +48,56 @@ function getName() {
   return name;
 }
 
-function connect(code) {
+let createTries = 0;
+
+function connect(code, create = false) {
   G.code = code;
   history.replaceState(null, '', `?r=${code}`);
-  G.net = new Net(code, getName(), onMessage, onDisconnected);
+  G.net = new Net(code, getName(), { create, onMsg: onMessage, onState: onNetState });
 }
 
-function onDisconnected() {
-  G.net = null;
+function onNetState(state) {
+  const el = $('netMsg');
+  if (state === 'open') {
+    el.classList.add('hidden');
+    return;
+  }
+  if (state === 'lost') {
+    // Keep rendering the race underneath — most dropouts last a second or two
+    // and the local car keeps driving; sends simply no-op until we are back.
+    el.textContent = 'Reconnecting…';
+    el.classList.remove('hidden');
+    return;
+  }
+  el.classList.add('hidden');
+  G.phase = 'menu';
+  G.race = null;
   showScreen('disc');
 }
 
 function onMessage(msg) {
   switch (msg.t) {
     case 'welcome': {
+      const racers = msg.racers || [];
+      // Same id back means the room recognised our resume token: our local car,
+      // lap count and clock are all still valid, so slot straight back in.
+      const resumed = msg.phase === 'racing' && msg.id === G.myId && G.race && racers.includes(msg.id);
       G.myId = msg.id;
       G.hostId = msg.hostId;
       G.players = new Map(msg.players.map((p) => [p.id, p]));
-      if (msg.phase === 'racing') {
+      if (resumed) {
+        G.phase = 'racing';
+        G.spectating = false;
+        G.remotes = new Map();
+        for (const id of racers) if (id !== G.myId) G.remotes.set(id, { snaps: [], lastS: null });
+        showScreen(null);
+      } else if (msg.phase === 'racing') {
         G.spectating = true;
         G.phase = 'racing';
         G.remotes = new Map(
-          msg.players.filter((p) => p.id !== G.myId).map((p) => [p.id, { snaps: [] }])
+          racers.filter((id) => id !== G.myId).map((id) => [id, { snaps: [], lastS: null }])
         );
-        G.race = { startAt: 0, order: msg.players.map((p) => p.id) };
+        G.race = { startAt: 0, order: racers };
         $('banner').textContent = 'Race in progress — you race next round';
         $('banner').classList.remove('hidden');
         showScreen(null);
@@ -74,11 +107,22 @@ function onMessage(msg) {
       break;
     }
     case 'full':
+      G.net.close();
       alert('That room is full (8 players max).');
       location.href = location.pathname;
       break;
+    case 'taken':
+      // Room code collision on create — roll another one.
+      G.net.close();
+      if (++createTries < 8) connect(genCode(), true);
+      else alert('Could not find a free room code. Try again.');
+      break;
     case 'join':
       G.players.set(msg.p.id, msg.p);
+      // A racer who dropped and reconnected needs its interpolation buffer back.
+      if (G.phase === 'racing' && G.race?.order.includes(msg.p.id) && msg.p.id !== G.myId) {
+        G.remotes.set(msg.p.id, { snaps: [], lastS: null });
+      }
       renderLobby();
       break;
     case 'leave':
@@ -114,7 +158,7 @@ function onMessage(msg) {
     case 'results':
       G.phase = 'results';
       G.spectating = false;
-      G.raceResults = msg.list;
+      G.results = msg.list;
       renderResults();
       showScreen('results');
       break;
@@ -175,7 +219,7 @@ function startRace(startIn, order) {
 
   const slots = startSlots(order.length);
   const myIdx = order.indexOf(G.myId);
-  for (const id of order) if (id !== G.myId) G.remotes.set(id, { snaps: [] });
+  for (const id of order) if (id !== G.myId) G.remotes.set(id, { snaps: [], lastS: null });
 
   const slot = myIdx >= 0 ? slots[myIdx] : slots[0];
   const startS = project(slot.x, slot.y).s;
@@ -184,6 +228,7 @@ function startRace(startIn, order) {
     order,
     car: createCar(slot.x, slot.y, slot.heading),
     lastS: startS,
+    onTrack: true,
     // Grid slots sit behind the line, so start the lap odometer negative:
     // every car completes each lap exactly at the finish line.
     lapDist: progressDelta(startS, 0),
@@ -191,10 +236,18 @@ function startRace(startIn, order) {
     wrongWayDist: 0,
     finished: false,
     finishMs: null,
+    lapStartAt: performance.now() + startIn,
+    bestLap: null,
     lastSend: 0,
+    lastHud: 0,
   };
+  G.cam.x = slot.x;
+  G.cam.y = slot.y;
+  renderer.clearSkids();
   $('banner').classList.add('hidden');
   $('lapText').textContent = `LAP 1/${LAPS}`;
+  $('lapTime').textContent = '0:00.00';
+  $('bestLap').textContent = 'BEST —';
   showScreen(null);
 }
 
@@ -212,53 +265,77 @@ function tickRace(now, dt) {
     cd.classList.add('hidden');
   }
 
-  if (!G.spectating) {
-    const car = race.car;
-    const live = countdownLeft <= 0 && !race.finished;
-    // Not live (countdown, or already finished): hold the brake so the car
-    // stays put on the grid / rolls to a stop after the flag.
-    const frameInput = live ? input : { steer: 0, brake: true };
-    const proj = project(car.x, car.y);
-    stepCar(car, frameInput, proj.d <= HALF_WIDTH, dt);
-    const b = TRACK.bounds;
-    car.x = Math.max(b.minX - 200, Math.min(b.maxX + 200, car.x));
-    car.y = Math.max(b.minY - 200, Math.min(b.maxY + 200, car.y));
+  if (G.spectating) return;
 
-    // Lap progress via wrap-aware accumulation; driving backwards subtracts,
-    // so cutting the line in reverse can't count a lap.
-    const proj2 = project(car.x, car.y);
-    const ds = progressDelta(proj2.s, race.lastS);
-    race.lastS = proj2.s;
-    if (live) {
-      race.lapDist += ds;
-      race.wrongWayDist = ds < -0.5 ? race.wrongWayDist + ds : 0;
-      if (race.lapDist >= TRACK.length) {
-        race.lapDist -= TRACK.length;
-        race.lapsDone++;
-        G.net.send({ t: 'lap', lap: race.lapsDone });
-        if (race.lapsDone >= LAPS) {
-          race.finished = true;
-          race.finishMs = Math.round(now - race.startAt);
-          G.net.send({ t: 'finish', ms: race.finishMs });
-          $('banner').textContent = `Finished — ${fmtTime(race.finishMs)}`;
-          $('banner').classList.remove('hidden');
-        } else {
-          $('lapText').textContent = `LAP ${race.lapsDone + 1}/${LAPS}`;
-        }
+  const car = race.car;
+  const live = countdownLeft <= 0 && !race.finished;
+  // Not live (countdown, or already finished): hold the brake so the car
+  // stays put on the grid / rolls to a stop after the flag.
+  stepCar(car, live ? input : PARKED, race.onTrack, dt);
+  const b = TRACK.bounds;
+  car.x = Math.max(b.minX - 200, Math.min(b.maxX + 200, car.x));
+  car.y = Math.max(b.minY - 200, Math.min(b.maxY + 200, car.y));
+
+  // One projection per frame, hinted by last frame's arc position. The
+  // surface it reports is used by the *next* step, which is a frame of lag
+  // nobody can see and saves sweeping the centerline twice.
+  const proj = project(car.x, car.y, race.lastS);
+  race.onTrack = proj.d <= HALF_WIDTH;
+  // Lap progress via wrap-aware accumulation; driving backwards subtracts,
+  // so cutting the line in reverse can't count a lap.
+  const ds = progressDelta(proj.s, race.lastS);
+  race.lastS = proj.s;
+
+  if (live) {
+    race.lapDist += ds;
+    race.wrongWayDist = ds < -0.5 ? race.wrongWayDist + ds : 0;
+    if (race.lapDist >= TRACK.length) {
+      race.lapDist -= TRACK.length;
+      race.lapsDone++;
+      const lapMs = Math.round(now - race.lapStartAt);
+      race.lapStartAt = now;
+      if (race.bestLap == null || lapMs < race.bestLap) {
+        race.bestLap = lapMs;
+        $('bestLap').textContent = `BEST ${fmtTime(lapMs)}`;
+      }
+      G.net.send({ t: 'lap', lap: race.lapsDone });
+      if (race.lapsDone >= LAPS) {
+        race.finished = true;
+        race.finishMs = Math.round(now - race.startAt);
+        G.net.send({ t: 'finish', ms: race.finishMs, best: race.bestLap });
+        $('banner').textContent = `Finished — ${fmtTime(race.finishMs)}`;
+        $('banner').classList.remove('hidden');
+      } else {
+        $('lapText').textContent = `LAP ${race.lapsDone + 1}/${LAPS}`;
       }
     }
-    $('wrongWay').classList.toggle('hidden', race.wrongWayDist > -70);
-
-    if (now - race.lastSend >= SEND_INTERVAL_MS) {
-      race.lastSend = now;
-      G.net.send({
-        t: 's',
-        x: Math.round(car.x * 10) / 10,
-        y: Math.round(car.y * 10) / 10,
-        h: Math.round(car.heading * 1000) / 1000,
-      });
+    if (now - race.lastHud >= HUD_INTERVAL_MS) {
+      race.lastHud = now;
+      $('lapTime').textContent = fmtTime(now - race.lapStartAt);
     }
   }
+  $('wrongWay').classList.toggle('hidden', race.wrongWayDist > -70);
+
+  maybeSkid(G.myId, car.x, car.y, car.heading, car.travel, car.speed, input.brake, now);
+
+  if (now - race.lastSend >= SEND_INTERVAL_MS) {
+    race.lastSend = now;
+    G.net.send({
+      t: 's',
+      x: Math.round(car.x * 10) / 10,
+      y: Math.round(car.y * 10) / 10,
+      h: Math.round(car.heading * 1000) / 1000,
+    });
+  }
+}
+
+// Rubber goes down when the car is sliding sideways, or hauling on the brakes.
+function maybeSkid(id, x, y, heading, travel, speed, braking, now) {
+  if (speed < 130) return;
+  const slip = Math.abs(angleDelta(heading, travel));
+  let strength = Math.min(1, Math.max(0, (slip - SKID_SLIP) * 2.5));
+  if (braking && speed > 200) strength = Math.max(strength, 0.55);
+  if (strength > 0) renderer.skid(id, x, y, heading, now, strength);
 }
 
 function remoteCarAt(id, now) {
@@ -277,10 +354,17 @@ function remoteCarAt(id, now) {
   if (target >= b.t) a = b; // no newer data: hold last known position
   const span = b.t - a.t;
   const t = span > 0 ? Math.max(0, Math.min(1, (target - a.t) / span)) : 1;
+  // Direction and speed of the packet pair stand in for the remote car's
+  // `travel`, which is what tells us it is sliding.
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const dist = Math.hypot(dx, dy);
+  const heading = a.h + angleDelta(b.h, a.h) * t;
   return {
-    x: a.x + (b.x - a.x) * t,
-    y: a.y + (b.y - a.y) * t,
-    heading: a.h + angleDelta(b.h, a.h) * t,
+    x: a.x + dx * t,
+    y: a.y + dy * t,
+    heading,
+    travel: dist > 0.5 ? Math.atan2(dy, dx) : heading,
+    speed: span > 0 ? (dist / span) * 1000 : 0,
   };
 }
 
@@ -294,7 +378,10 @@ function totalProgress(id, now) {
   }
   const pos = remoteCarAt(id, now);
   if (!pos) return -1;
-  return (p?.lap || 0) * TRACK.length + project(pos.x, pos.y).s;
+  const r = G.remotes.get(id);
+  const proj = project(pos.x, pos.y, r.lastS);
+  r.lastS = proj.s;
+  return (p?.lap || 0) * TRACK.length + proj.s;
 }
 
 function renderStandings(now) {
@@ -329,7 +416,7 @@ function renderStandings(now) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  return String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
 const fmtTime = (ms) => {
@@ -339,18 +426,20 @@ const fmtTime = (ms) => {
 };
 
 function renderResults() {
-  if (G.phase !== 'results' || !G.raceResults) return;
+  if (G.phase !== 'results' || !G.results) return;
   const tbody = $('resultRows');
   tbody.innerHTML = '';
-  G.raceResults.forEach((r, i) => {
+  G.results.forEach((r, i) => {
     const p = G.players.get(r.id);
-    if (!p) return;
+    const name = r.name ?? p?.name ?? 'Racer';
+    const color = PALETTE[(r.color ?? p?.color ?? 0) % PALETTE.length];
     const tr = document.createElement('tr');
     if (r.id === G.myId) tr.className = 'me';
     tr.innerHTML =
       `<td>${i + 1}</td>` +
-      `<td><span class="dot" style="background:${PALETTE[p.color % PALETTE.length]}"></span> ${escapeHtml(p.name)}</td>` +
-      `<td>${r.ms == null ? 'DNF' : fmtTime(r.ms)}</td>`;
+      `<td><span class="dot" style="background:${color}"></span> ${escapeHtml(name)}</td>` +
+      `<td>${r.ms == null ? 'DNF' : fmtTime(r.ms)}</td>` +
+      `<td>${r.best == null ? '—' : fmtTime(r.best)}</td>`;
     tbody.append(tr);
   });
   const isHost = G.myId === G.hostId;
@@ -380,32 +469,39 @@ function frame(now) {
     const pos = remoteCarAt(id, now);
     const p = G.players.get(id);
     if (!pos || !p) continue;
-    cars.push({ ...pos, color: PALETTE[p.color % PALETTE.length], name: p.name });
+    maybeSkid(id, pos.x, pos.y, pos.heading, pos.travel, pos.speed, false, now);
+    cars.push({ ...pos, id, color: PALETTE[p.color % PALETTE.length], name: p.name });
   }
-  let camX, camY;
+
+  let targetX, targetY;
   if (!G.spectating) {
     const car = G.race.car;
     cars.push({
-      x: car.x, y: car.y, heading: car.heading,
+      x: car.x, y: car.y, heading: car.heading, id: G.myId,
       color: PALETTE[(G.players.get(G.myId)?.color ?? 0) % PALETTE.length],
       braking: input.brake, isMe: true,
     });
-    camX = car.x; camY = car.y;
+    // Lead the camera down the road so there is time to react at speed.
+    targetX = car.x + Math.cos(car.travel) * car.speed * CAM_LEAD_S;
+    targetY = car.y + Math.sin(car.travel) * car.speed * CAM_LEAD_S;
   } else {
     // Spectate whoever is furthest along.
-    let best = cars[0];
-    let bestProg = -1;
+    let bestId = null, bestProg = -Infinity;
     for (const [id] of G.remotes) {
       const prog = totalProgress(id, now);
-      if (prog > bestProg && prog !== Infinity) {
+      if (prog !== Infinity && prog > bestProg) {
         bestProg = prog;
-        best = cars.find((c) => c.name === G.players.get(id)?.name) || best;
+        bestId = id;
       }
     }
-    camX = best ? best.x : TRACK.pts[0][0];
-    camY = best ? best.y : TRACK.pts[0][1];
+    const lead = cars.find((c) => c.id === bestId) || cars[0];
+    targetX = lead ? lead.x : TRACK.pts[0][0];
+    targetY = lead ? lead.y : TRACK.pts[0][1];
   }
-  renderer.draw(camX, camY, cars);
+  const k = 1 - Math.exp(-CAM_SMOOTH * dt);
+  G.cam.x += (targetX - G.cam.x) * k;
+  G.cam.y += (targetY - G.cam.y) * k;
+  renderer.draw(G.cam.x, G.cam.y, cars, now);
 
   if (now - lastStandings > 500) {
     lastStandings = now;
@@ -446,6 +542,12 @@ window.addEventListener('keyup', (e) => {
   keys.delete(e.code);
   updateKeyInput();
 });
+// A tab switch eats the keyup, which would otherwise leave the car locked
+// into a turn when you come back.
+window.addEventListener('blur', () => {
+  keys.clear();
+  updateKeyInput();
+});
 
 // Touch: left/right edge zones steer, middle zone brakes. Auto-accelerate.
 function readTouches(touches) {
@@ -471,7 +573,10 @@ for (const ev of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) {
 
 $('nameInput').value = localStorage.getItem('racer-name') || '';
 
-$('createBtn').addEventListener('click', () => connect(genCode()));
+$('createBtn').addEventListener('click', () => {
+  createTries = 0;
+  connect(genCode(), true);
+});
 $('joinBtn').addEventListener('click', () => {
   const code = $('codeInput').value.trim().toUpperCase();
   if (/^[A-Z0-9]{4,8}$/.test(code)) connect(code);

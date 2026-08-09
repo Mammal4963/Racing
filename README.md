@@ -6,11 +6,14 @@ taps it is on the starting grid.
 
 - **Top-down arcade driving** — auto-accelerate, steer with your thumbs,
   drift through corners. Grass slows you down; there are no walls to get
-  stuck on.
+  stuck on. Slide hard enough and you leave rubber on the road.
 - **Ghost multiplayer** — cars don't collide, so every phone simulates its own
   car and just streams positions. No lag fights, no rubber-banding.
 - **Rooms with 4-letter codes** — up to 8 players, first player in is the host.
-- **3-lap races** with live standings, a finish cutoff, and a results screen.
+- **3-lap races** with live standings, lap and best-lap timing, a finish
+  cutoff, and a results screen.
+- **Survives a dropped signal** — lock your phone or walk into a tunnel and
+  the client reconnects and climbs back into the same car, mid-race.
 
 ## How it works
 
@@ -26,6 +29,12 @@ interpolating between the last two packets. The Durable Object is a relay plus
 referee: lobby state, start countdown, lap reports, finish order, and a 45s
 cutoff after the first finisher.
 
+The room persists the race it is running, because a Durable Object can be
+evicted between messages and would otherwise wake up having forgotten it. It
+also hands each player a resume token: a socket that drops is parked for 25
+seconds rather than deleted, so a reconnecting phone gets its own car, colour
+and place in the running order back.
+
 ## Develop
 
 ```sh
@@ -33,8 +42,9 @@ npm install
 npm run dev        # http://localhost:8787 — open two tabs to race yourself
 ```
 
-With the dev server running, `node test/smoke.mjs` plays a full two-player
-race in headless Chromium (lobby → countdown → laps → results → race again)
+With the dev server running, `npm test` plays a full race in headless Chromium
+— lobby, countdown, driving, replication between clients, a mid-race
+disconnect that resumes, a late joiner who spectates, results, race again —
 and saves a screenshot to `test/race.png`. Set `CHROMIUM_PATH` if Playwright
 hasn't downloaded its own browser.
 
