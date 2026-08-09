@@ -1,16 +1,77 @@
-// The circuit: a closed centerline sampled from a Catmull-Rom spline through
+// The circuits: closed centerlines sampled from Catmull-Rom splines through
 // hand-placed control points, plus the geometry helpers the game needs
 // (closest-point projection for lap progress + off-track detection).
+//
+// Each layout carries its own width and palette, so the tracks feel different
+// to drive and read differently at a glance. `TRACK` is the one currently
+// loaded — a live binding, so importers see the swap.
 
-const CONTROL = [
-  [260, 1180], [700, 1290], [1250, 1300], [1750, 1220], [2010, 1000],
-  [2030, 640], [1830, 430], [1500, 400], [1290, 560], [1040, 620],
-  [830, 470], [520, 400], [280, 560], [200, 870],
+const LAYOUTS = [
+  {
+    name: 'Harbour Loop',
+    blurb: 'flowing · forgiving',
+    width: 96,
+    theme: {
+      ground: '#2b5231', groundAlt: ['#26492c', '#315c38'], void: '#1c3521',
+      road: '#3a3d46', edge: '#dcdce2', mid: 'rgba(220,220,226,0.28)',
+    },
+    control: [
+      [260, 1180], [700, 1290], [1250, 1300], [1750, 1220], [2010, 1000],
+      [2030, 640], [1830, 430], [1500, 400], [1290, 560], [1040, 620],
+      [830, 470], [520, 400], [280, 560], [200, 870],
+    ],
+  },
+  {
+    name: 'Sunset Ridge',
+    blurb: 'wide open · very fast',
+    width: 112,
+    theme: {
+      ground: '#6b4a33', groundAlt: ['#5d3f2b', '#785539'], void: '#4a3225',
+      road: '#4a4048', edge: '#f0e0cc', mid: 'rgba(240,224,204,0.26)',
+    },
+    control: [
+      [620, 1255], [1150, 1315], [1700, 1250], [2000, 1010], [2010, 700],
+      [1750, 520], [1350, 500], [980, 545], [660, 620], [450, 780],
+      [400, 980], [520, 1130],
+    ],
+  },
+  {
+    name: 'Chicane Bay',
+    blurb: 'technical · brake late',
+    width: 92,
+    theme: {
+      ground: '#2e4a58', groundAlt: ['#28414d', '#365664'], void: '#1e333d',
+      road: '#39434a', edge: '#d8e4ea', mid: 'rgba(216,228,234,0.28)',
+    },
+    control: [
+      [380, 1150], [760, 1270], [1120, 1195], [1265, 1290], [1580, 1250],
+      [1900, 1120], [1990, 900], [1830, 755], [1570, 815], [1420, 670],
+      [1150, 615], [900, 690], [640, 545], [400, 640], [285, 890],
+    ],
+  },
+  {
+    name: 'Nightport',
+    blurb: 'tight · punishing',
+    width: 84,
+    theme: {
+      ground: '#1d2230', groundAlt: ['#191d29', '#232838'], void: '#141821',
+      road: '#2c3038', edge: '#c8ccd8', mid: 'rgba(200,204,216,0.22)',
+    },
+    control: [
+      [350, 1080], [620, 1230], [900, 1120], [1080, 1250], [1380, 1230],
+      [1600, 1060], [1560, 840], [1780, 700], [1900, 480], [1650, 380],
+      [1350, 470], [1080, 420], [820, 500], [560, 460], [330, 620], [260, 860],
+    ],
+  },
 ];
+
 const SAMPLES_PER_SEG = 12;
 
-export const TRACK_WIDTH = 96;
-export const HALF_WIDTH = TRACK_WIDTH / 2;
+export const TRACK_COUNT = LAYOUTS.length;
+export const trackInfo = (i) => {
+  const l = LAYOUTS[((i % TRACK_COUNT) + TRACK_COUNT) % TRACK_COUNT];
+  return { name: l.name, blurb: l.blurb };
+};
 
 function catmullRom(p0, p1, p2, p3, t) {
   const t2 = t * t;
@@ -25,7 +86,9 @@ function catmullRom(p0, p1, p2, p3, t) {
   ];
 }
 
-function buildTrack() {
+function buildTrack(index) {
+  const layout = LAYOUTS[((index % TRACK_COUNT) + TRACK_COUNT) % TRACK_COUNT];
+  const CONTROL = layout.control;
   const n = CONTROL.length;
   const pts = [];
   for (let i = 0; i < n; i++) {
@@ -45,16 +108,31 @@ function buildTrack() {
     const b = pts[i % m];
     cum.push(cum[i - 1] + Math.hypot(b[0] - a[0], b[1] - a[1]));
   }
-  const length = cum[m];
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const [x, y] of pts) {
     minX = Math.min(minX, x); maxX = Math.max(maxX, x);
     minY = Math.min(minY, y); maxY = Math.max(maxY, y);
   }
-  return { pts, cum, length, bounds: { minX, minY, maxX, maxY } };
+  return {
+    index: ((index % TRACK_COUNT) + TRACK_COUNT) % TRACK_COUNT,
+    name: layout.name,
+    blurb: layout.blurb,
+    theme: layout.theme,
+    width: layout.width,
+    half: layout.width / 2,
+    pts,
+    cum,
+    length: cum[m],
+    bounds: { minX, minY, maxX, maxY },
+  };
 }
 
-export const TRACK = buildTrack();
+export let TRACK = buildTrack(0);
+
+export function setTrack(index) {
+  TRACK = buildTrack(index);
+  return TRACK;
+}
 
 const PROJECT_WINDOW = 420; // arc units searched either side of a hint
 
@@ -96,7 +174,7 @@ function scan(x, y, first, count) {
 }
 
 // Closest point on the centerline. Returns arc position `s` in [0, length)
-// and perpendicular distance `d` (d > HALF_WIDTH means off the asphalt).
+// and perpendicular distance `d` (d > TRACK.half means off the asphalt).
 //
 // Pass `hintS` — the caller's previous `s` — to search only the stretch of
 // track around it. That is both cheaper than sweeping the whole circuit every

@@ -46,9 +46,9 @@ await p1.waitForFunction(() => window.__game.phase === 'racing', null, { timeout
 await p2.waitForFunction(() => window.__game.phase === 'racing', null, { timeout: 5000 });
 ok('both clients entered racing phase');
 
-// Countdown text visible
-const cd = await p1.textContent('#countdown');
-ok(`countdown showing: "${cd.trim()}"`);
+// Start lights should come on one at a time before the green.
+await p1.waitForFunction(() => document.querySelectorAll('#lights i.on').length >= 2, null, { timeout: 6000 });
+ok(`start lights sequencing (${await p1.$$eval('#lights i.on', (e) => e.length)}/5 lit)`);
 
 // --- Wait out the countdown, hold no keys: auto-accelerate should move cars.
 await p1.waitForFunction(() => performance.now() > window.__game.race.startAt + 500, null, { timeout: 8000 });
@@ -105,6 +105,34 @@ await p1.evaluate(() => {
 });
 if (h3 - h2 < 0.1) fail(`touch steer had no effect (dh=${(h3 - h2).toFixed(3)})`);
 ok(`touch steering works (dh=${(h3 - h2).toFixed(2)} rad)`);
+
+// --- Drifting: braking while steering should charge the boost meter, and the
+// HUD bar should follow it.
+if (!(await p1.$eval('#lights', (el) => el.classList.contains('hidden')))) {
+  fail('start lights still showing after the green');
+}
+await p1.evaluate(async () => {
+  const { pointAt } = await import('/js/track.js');
+  const g = window.__game;
+  const pos = pointAt(g.race.lastS + 40);
+  Object.assign(g.race.car, { x: pos.x, y: pos.y, heading: pos.ang, travel: pos.ang, speed: 320 });
+});
+await p1.keyboard.down('ArrowRight');
+await p1.keyboard.down('ArrowDown');
+let peakCharge = 0, barAtPeak = '0%';
+for (let i = 0; i < 8; i++) {
+  const s = await p1.evaluate(() => ({
+    c: window.__game.race.car.charge,
+    w: document.getElementById('boostBar').style.width,
+  }));
+  if (s.c > peakCharge) { peakCharge = s.c; barAtPeak = s.w; }
+  await p1.waitForTimeout(60);
+}
+await p1.keyboard.up('ArrowDown');
+await p1.keyboard.up('ArrowRight');
+if (peakCharge <= 0) fail('braking into a turn never charged the boost meter');
+if (barAtPeak === '0%') fail('boost meter charged but the HUD bar stayed empty');
+ok(`drifting charges the boost meter (peak ${peakCharge.toFixed(2)}, bar ${barAtPeak})`);
 
 // --- Reconnect: drop p2's socket mid-race. It should climb back into the same
 // car (same id, same lap) instead of dead-ending on the disconnect screen.
@@ -191,9 +219,53 @@ await p1.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
 await p2.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
 ok('race again returns both clients to lobby');
 
-// --- Screenshot for the human
+// --- Championship: points, standings, and a new circuit each round.
+// Carol leaves first so the round doesn't wait on a car nobody is driving.
+await p3.context().close();
+await p1.waitForFunction(() => document.querySelectorAll('#playerList li').length === 2, null, { timeout: 8000 });
+
+await p1.click('#roundPick .pick:nth-child(2)'); // 3 rounds
+await p2.waitForFunction(() => window.__game.setup.rounds === 3, null, { timeout: 5000 });
+ok('host race setup propagates to the other players');
+
 await p1.click('#startBtn');
-await p1.waitForFunction(() => window.__game.phase === 'racing' && performance.now() > window.__game.race.startAt + 1500, null, { timeout: 10000 });
+await p1.waitForFunction(() => window.__game.phase === 'racing', null, { timeout: 8000 });
+await p2.waitForFunction(() => window.__game.phase === 'racing', null, { timeout: 8000 });
+const round1Track = await p1.evaluate(() => window.__game.series && document.getElementById('trackTag').textContent);
+if (!/R1\/3/.test(round1Track || '')) fail(`round 1 not flagged in the HUD: ${round1Track}`);
+ok(`championship round 1 under way (${round1Track})`);
+
+// Laps only count once the lights go out, so wait for the green first.
+for (const page of [p1, p2]) {
+  await page.waitForFunction(() => performance.now() > window.__game.race.startAt, null, { timeout: 12000 });
+}
+for (let i = 0; i < 240; i++) {
+  await p1.evaluate(() => window.__hop());
+  await p2.evaluate(() => window.__hop());
+  await p1.waitForTimeout(30);
+  if (await p1.evaluate(() => window.__game.phase === 'results')) break;
+}
+if (await p1.evaluate(() => window.__game.phase !== 'results')) {
+  fail(`championship round 1 never finished (laps: ${await p1.evaluate(() => window.__game.race?.lapsDone)})`);
+}
+
+const standings = await p1.$$eval('#seriesRows tr', (trs) => trs.map((tr) => tr.textContent.trim()));
+if (standings.length !== 2) fail(`expected 2 championship rows, got ${JSON.stringify(standings)}`);
+const points = await p1.evaluate(() => window.__game.series.standings.map((s) => s.pts));
+if (points[0] !== 10 || points[1] !== 8) fail(`unexpected points: ${JSON.stringify(points)}`);
+ok(`championship standings after round 1: ${JSON.stringify(standings)}`);
+
+const nextLabel = await p1.textContent('#againBtn');
+if (!/Next round/.test(nextLabel)) fail(`expected a next-round button, got "${nextLabel}"`);
+await p1.click('#againBtn');
+await p1.waitForFunction(() => window.__game.phase === 'racing', null, { timeout: 10000 });
+await p2.waitForFunction(() => window.__game.phase === 'racing', null, { timeout: 10000 });
+const round2Track = await p1.evaluate(() => document.getElementById('trackTag').textContent);
+if (round2Track === round1Track) fail(`round 2 reused the same circuit: ${round2Track}`);
+ok(`round 2 moved to a different circuit (${round1Track} → ${round2Track})`);
+
+// --- Screenshot for the human
+await p1.waitForFunction(() => performance.now() > window.__game.race.startAt + 1500, null, { timeout: 12000 });
 await p1.screenshot({ path: new URL('./race.png', import.meta.url).pathname });
 ok('screenshot saved');
 

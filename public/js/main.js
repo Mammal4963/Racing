@@ -1,7 +1,10 @@
-import { TRACK, HALF_WIDTH, project, progressDelta, startSlots } from './track.js';
-import { createCar, stepCar, angleDelta } from './car.js';
+import {
+  TRACK, TRACK_COUNT, trackInfo, setTrack, project, progressDelta, startSlots,
+} from './track.js';
+import { createCar, stepCar, angleDelta, driftTier, TIER_COLOR } from './car.js';
 import { Net } from './net.js';
 import { Renderer, PALETTE } from './render.js';
+import { Sound } from './audio.js';
 
 const LAPS = 3;
 const SEND_INTERVAL_MS = 66; // ~15 position packets/sec
@@ -10,6 +13,15 @@ const CAM_LEAD_S = 0.26; // camera looks this far up the road
 const CAM_SMOOTH = 7; // camera catch-up rate; higher is tighter
 const HUD_INTERVAL_MS = 60;
 const SKID_SLIP = 0.22; // radians of slide before the tyres start marking
+const LIGHT_STEP_MS = 800; // one start light per this long
+const ROUND_CHOICES = [1, 3, 5];
+
+// Slipstream: how close, how directly in front, and how aligned another car
+// has to be before you start getting towed along behind it.
+const DRAFT_NEAR = 26;
+const DRAFT_FAR = 200;
+const DRAFT_CONE = 0.45;
+const DRAFT_ALIGN = 1.1;
 
 const $ = (id) => document.getElementById(id);
 const screens = { menu: $('menu'), lobby: $('lobby'), results: $('results'), disc: $('disconnected') };
@@ -30,11 +42,50 @@ const G = {
   remotes: new Map(), // id -> {snaps: [{t,x,y,h}], lastS}
   race: null,
   results: null,
+  series: null,
+  setup: { track: 0, rounds: 1 },
+  lastPos: 0,
   cam: { x: 0, y: 0 },
 };
 
 const input = { steer: 0, brake: false };
 const PARKED = { steer: 0, brake: true };
+const sound = new Sound();
+
+// ------------------------------------------------------------------ helpers
+
+const fmtTime = (ms) => {
+  const m = Math.floor(ms / 60000);
+  const s = ((ms % 60000) / 1000).toFixed(2);
+  return `${m}:${s.padStart(5, '0')}`;
+};
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+}
+
+function buzz(pattern) {
+  try { navigator.vibrate?.(pattern); } catch { /* not supported */ }
+}
+
+let toastTimer = 0;
+function toast(text, color = '#ffd740', ms = 950) {
+  const el = $('toast');
+  el.textContent = text;
+  el.style.color = color;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), ms);
+}
+
+const pbKey = (track) => `pb-track-${track}`;
+const personalBest = (track) => Number(localStorage.getItem(pbKey(track))) || 0;
+
+function useTrack(index) {
+  if (TRACK.index === index) return;
+  setTrack(index);
+  renderer.useTrack();
+}
 
 // ---------------------------------------------------------------- menu / net
 
@@ -72,6 +123,7 @@ function onNetState(state) {
   el.classList.add('hidden');
   G.phase = 'menu';
   G.race = null;
+  sound.silence();
   showScreen('disc');
 }
 
@@ -85,6 +137,9 @@ function onMessage(msg) {
       G.myId = msg.id;
       G.hostId = msg.hostId;
       G.players = new Map(msg.players.map((p) => [p.id, p]));
+      G.setup = msg.setup || G.setup;
+      G.series = msg.series || null;
+      if (msg.phase === 'racing') useTrack(msg.track | 0);
       if (resumed) {
         G.phase = 'racing';
         G.spectating = false;
@@ -97,7 +152,8 @@ function onMessage(msg) {
         G.remotes = new Map(
           racers.filter((id) => id !== G.myId).map((id) => [id, { snaps: [], lastS: null }])
         );
-        G.race = { startAt: 0, order: racers };
+        G.race = { startAt: 0, startIn: 0, order: racers, lights: -1, lightsOut: true };
+        $('trackTag').textContent = TRACK.name;
         $('banner').textContent = 'Race in progress — you race next round';
         $('banner').classList.remove('hidden');
         showScreen(null);
@@ -135,8 +191,13 @@ function onMessage(msg) {
       renderLobby();
       renderResults();
       break;
+    case 'setup':
+      G.setup = { track: msg.track, rounds: msg.rounds };
+      renderSetup();
+      break;
     case 'go':
-      startRace(msg.startIn, msg.order);
+      G.series = msg.series || null;
+      startRace(msg.startIn, msg.order, msg.track | 0);
       break;
     case 's': {
       const r = G.remotes.get(msg.id);
@@ -159,6 +220,8 @@ function onMessage(msg) {
       G.phase = 'results';
       G.spectating = false;
       G.results = msg.list;
+      G.series = msg.series || null;
+      sound.silence();
       renderResults();
       showScreen('results');
       break;
@@ -175,7 +238,9 @@ function enterLobby() {
   G.spectating = false;
   G.race = null;
   G.remotes = new Map();
+  G.series = null;
   for (const p of G.players.values()) { delete p.lap; delete p.finishMs; }
+  sound.silence();
   $('banner').classList.add('hidden');
   $('roomCode').textContent = G.code;
   renderLobby();
@@ -200,6 +265,7 @@ function renderLobby() {
   const isHost = G.myId === G.hostId;
   $('startBtn').classList.toggle('hidden', !isHost);
   $('waitMsg').classList.toggle('hidden', isHost);
+  renderSetup();
 }
 
 function makeTag(text) {
@@ -209,12 +275,62 @@ function makeTag(text) {
   return s;
 }
 
+function buildPickers() {
+  const tp = $('trackPick');
+  for (let i = 0; i < TRACK_COUNT; i++) {
+    const b = document.createElement('button');
+    b.className = 'pick';
+    b.dataset.track = String(i);
+    b.innerHTML = `${escapeHtml(trackInfo(i).name)}<small></small>`;
+    b.addEventListener('click', () => sendSetup({ track: i }));
+    tp.append(b);
+  }
+  const rp = $('roundPick');
+  for (const r of ROUND_CHOICES) {
+    const b = document.createElement('button');
+    b.className = 'pick';
+    b.dataset.rounds = String(r);
+    b.textContent = r === 1 ? 'Single race' : `${r} rounds`;
+    b.addEventListener('click', () => sendSetup({ rounds: r }));
+    rp.append(b);
+  }
+}
+
+function sendSetup(patch) {
+  G.setup = { ...G.setup, ...patch };
+  renderSetup();
+  G.net?.send({ t: 'setup', ...G.setup });
+}
+
+function renderSetup() {
+  const isHost = G.myId === G.hostId;
+  $('setupBox').classList.toggle('hidden', !isHost);
+  for (const b of $('trackPick').children) {
+    const i = Number(b.dataset.track);
+    b.classList.toggle('on', i === G.setup.track);
+    // Your own best lap is the reason to come back to a circuit.
+    const pb = personalBest(i);
+    b.querySelector('small').textContent = pb ? `best ${fmtTime(pb)}` : trackInfo(i).blurb;
+  }
+  for (const b of $('roundPick').children) {
+    b.classList.toggle('on', Number(b.dataset.rounds) === G.setup.rounds);
+  }
+  const t = trackInfo(G.setup.track);
+  const len = G.setup.rounds === 1 ? 'single race' : `${G.setup.rounds}-round championship`;
+  $('setupInfo').innerHTML = isHost ? '' : `<b>${escapeHtml(t.name)}</b> · ${len}`;
+  $('setupInfo').classList.toggle('hidden', isHost);
+  $('startBtn').textContent =
+    G.setup.rounds === 1 ? `Start race · ${t.name}` : `Start ${G.setup.rounds}-round championship`;
+}
+
 // --------------------------------------------------------------------- race
 
-function startRace(startIn, order) {
+function startRace(startIn, order, track) {
+  useTrack(track);
   G.phase = 'racing';
   G.spectating = !order.includes(G.myId);
   G.remotes = new Map();
+  G.lastPos = 0;
   for (const p of G.players.values()) { p.lap = 0; delete p.finishMs; }
 
   const slots = startSlots(order.length);
@@ -225,6 +341,7 @@ function startRace(startIn, order) {
   const startS = project(slot.x, slot.y).s;
   G.race = {
     startAt: performance.now() + startIn,
+    startIn,
     order,
     car: createCar(slot.x, slot.y, slot.heading),
     lastS: startS,
@@ -238,6 +355,9 @@ function startRace(startIn, order) {
     finishMs: null,
     lapStartAt: performance.now() + startIn,
     bestLap: null,
+    boostTier: 1,
+    lights: -1,
+    lightsOut: false,
     lastSend: 0,
     lastHud: 0,
   };
@@ -248,30 +368,74 @@ function startRace(startIn, order) {
   $('lapText').textContent = `LAP 1/${LAPS}`;
   $('lapTime').textContent = '0:00.00';
   $('bestLap').textContent = 'BEST —';
+  $('trackTag').textContent =
+    TRACK.name + (G.series ? ` · R${G.series.round}/${G.series.rounds}` : '');
+  $('boostBar').style.width = '0%';
+  $('boostCap').classList.toggle('hidden', personalBest(TRACK.index) > 0);
+  $('draftTag').classList.add('hidden');
   showScreen(null);
+  sound.unlock();
 }
 
-function tickRace(now, dt) {
-  const race = G.race;
-  const countdownLeft = race.startAt - now;
+// F1-style start lights: they come on one at a time, then all go out at once.
+function updateLights(race, left) {
+  const lights = $('lights');
   const cd = $('countdown');
-  if (countdownLeft > 0) {
-    cd.classList.remove('hidden');
-    cd.textContent = countdownLeft > 3000 ? 'READY' : String(Math.ceil(countdownLeft / 1000));
-  } else if (countdownLeft > -900) {
+  if (left > 0) {
+    const on = Math.max(0, Math.min(5, Math.floor((race.startIn - left) / LIGHT_STEP_MS)));
+    if (on !== race.lights) {
+      race.lights = on;
+      if (on > 0) { sound.light(false); buzz(12); }
+    }
+    lights.classList.remove('hidden');
+    [...lights.children].forEach((el, i) => el.classList.toggle('on', i < on));
+    cd.classList.add('hidden');
+    return;
+  }
+  if (!race.lightsOut) {
+    race.lightsOut = true;
+    sound.light(true);
+    buzz([0, 40]);
+    renderer.kick(7);
+  }
+  lights.classList.add('hidden');
+  if (left > -900) {
     cd.classList.remove('hidden');
     cd.textContent = 'GO!';
   } else {
     cd.classList.add('hidden');
   }
+}
 
-  if (G.spectating) return;
+// How hard the car in front is towing us along, 0..1.
+function draftAmount(car, others) {
+  let best = 0;
+  for (const o of others) {
+    const dx = o.x - car.x, dy = o.y - car.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < DRAFT_NEAR || dist > DRAFT_FAR) continue;
+    if (Math.abs(angleDelta(Math.atan2(dy, dx), car.travel)) > DRAFT_CONE) continue;
+    if (Math.abs(angleDelta(o.heading, car.heading)) > DRAFT_ALIGN) continue;
+    best = Math.max(best, 1 - (dist - DRAFT_NEAR) / (DRAFT_FAR - DRAFT_NEAR));
+  }
+  return best;
+}
+
+function tickRace(now, dt, others) {
+  const race = G.race;
+  updateLights(race, race.startAt - now);
+
+  if (G.spectating) {
+    sound.drive({ live: false });
+    return;
+  }
 
   const car = race.car;
-  const live = countdownLeft <= 0 && !race.finished;
+  const live = race.startAt - now <= 0 && !race.finished;
   // Not live (countdown, or already finished): hold the brake so the car
   // stays put on the grid / rolls to a stop after the flag.
-  stepCar(car, live ? input : PARKED, race.onTrack, dt);
+  const draft = live ? draftAmount(car, others) : 0;
+  stepCar(car, live ? input : PARKED, { onTrack: race.onTrack, draft }, dt);
   const b = TRACK.bounds;
   car.x = Math.max(b.minX - 200, Math.min(b.maxX + 200, car.x));
   car.y = Math.max(b.minY - 200, Math.min(b.maxY + 200, car.y));
@@ -280,7 +444,7 @@ function tickRace(now, dt) {
   // surface it reports is used by the *next* step, which is a frame of lag
   // nobody can see and saves sweeping the centerline twice.
   const proj = project(car.x, car.y, race.lastS);
-  race.onTrack = proj.d <= HALF_WIDTH;
+  race.onTrack = proj.d <= TRACK.half;
   // Lap progress via wrap-aware accumulation; driving backwards subtracts,
   // so cutting the line in reverse can't count a lap.
   const ds = progressDelta(proj.s, race.lastS);
@@ -289,26 +453,7 @@ function tickRace(now, dt) {
   if (live) {
     race.lapDist += ds;
     race.wrongWayDist = ds < -0.5 ? race.wrongWayDist + ds : 0;
-    if (race.lapDist >= TRACK.length) {
-      race.lapDist -= TRACK.length;
-      race.lapsDone++;
-      const lapMs = Math.round(now - race.lapStartAt);
-      race.lapStartAt = now;
-      if (race.bestLap == null || lapMs < race.bestLap) {
-        race.bestLap = lapMs;
-        $('bestLap').textContent = `BEST ${fmtTime(lapMs)}`;
-      }
-      G.net.send({ t: 'lap', lap: race.lapsDone });
-      if (race.lapsDone >= LAPS) {
-        race.finished = true;
-        race.finishMs = Math.round(now - race.startAt);
-        G.net.send({ t: 'finish', ms: race.finishMs, best: race.bestLap });
-        $('banner').textContent = `Finished — ${fmtTime(race.finishMs)}`;
-        $('banner').classList.remove('hidden');
-      } else {
-        $('lapText').textContent = `LAP ${race.lapsDone + 1}/${LAPS}`;
-      }
-    }
+    if (race.lapDist >= TRACK.length) completeLap(race, now);
     if (now - race.lastHud >= HUD_INTERVAL_MS) {
       race.lastHud = now;
       $('lapTime').textContent = fmtTime(now - race.lapStartAt);
@@ -316,7 +461,7 @@ function tickRace(now, dt) {
   }
   $('wrongWay').classList.toggle('hidden', race.wrongWayDist > -70);
 
-  maybeSkid(G.myId, car.x, car.y, car.heading, car.travel, car.speed, input.brake, now);
+  driveEffects(race, car, draft, live, now);
 
   if (now - race.lastSend >= SEND_INTERVAL_MS) {
     race.lastSend = now;
@@ -329,13 +474,102 @@ function tickRace(now, dt) {
   }
 }
 
-// Rubber goes down when the car is sliding sideways, or hauling on the brakes.
-function maybeSkid(id, x, y, heading, travel, speed, braking, now) {
-  if (speed < 130) return;
-  const slip = Math.abs(angleDelta(heading, travel));
+function completeLap(race, now) {
+  race.lapDist -= TRACK.length;
+  race.lapsDone++;
+  const lapMs = Math.round(now - race.lapStartAt);
+  race.lapStartAt = now;
+
+  const improved = race.bestLap != null && lapMs < race.bestLap;
+  if (race.bestLap == null || lapMs < race.bestLap) {
+    race.bestLap = lapMs;
+    $('bestLap').textContent = `BEST ${fmtTime(lapMs)}`;
+  }
+  const pb = personalBest(TRACK.index);
+  if (!pb || lapMs < pb) {
+    localStorage.setItem(pbKey(TRACK.index), String(lapMs));
+    if (pb) {
+      toast('TRACK RECORD', '#ffd740', 1300);
+      sound.best();
+    }
+  } else if (improved) {
+    toast('BEST LAP', '#69f0ae');
+    sound.best();
+  } else {
+    sound.lap();
+  }
+
+  G.net.send({ t: 'lap', lap: race.lapsDone });
+
+  if (race.lapsDone >= LAPS) {
+    race.finished = true;
+    race.finishMs = Math.round(now - race.startAt);
+    G.net.send({ t: 'finish', ms: race.finishMs, best: race.bestLap });
+    $('banner').textContent = `Finished — ${fmtTime(race.finishMs)}`;
+    $('banner').classList.remove('hidden');
+    sound.flag(G.lastPos === 1);
+    buzz([0, 60, 40, 60]);
+    renderer.kick(9);
+    return;
+  }
+  $('lapText').textContent = `LAP ${race.lapsDone + 1}/${LAPS}`;
+  if (race.lapsDone === LAPS - 1) toast('FINAL LAP', '#ff5252', 1300);
+}
+
+// Particles, shake, sound and haptics — everything that sells the driving.
+function driveEffects(race, car, draft, live, now) {
+  const tier = driftTier(car.charge);
+
+  if (car.released) {
+    race.boostTier = car.released;
+    $('boostCap').classList.add('hidden'); // you've got it — stop explaining
+    renderer.burst(car.x, car.y, car.released);
+    renderer.kick(5 + car.released * 3);
+    sound.turbo(car.released);
+    buzz(car.released >= 3 ? [0, 20, 30, 45] : 18);
+    toast(['', 'TURBO', 'BIG TURBO', 'MEGA TURBO'][car.released], TIER_COLOR[car.released], 700);
+  }
+  if (car.dumped) {
+    sound.dumped();
+    toast('LOST IT', '#ff5252', 700);
+  }
+  if (car.boostMs > 0) {
+    renderer.flame(car.x, car.y, car.heading, race.boostTier);
+    if (Math.random() < 0.5) renderer.flame(car.x, car.y, car.heading, race.boostTier);
+  }
+  if (car.drifting && tier > 0 && Math.random() < 0.6) {
+    const back = car.heading + Math.PI;
+    renderer.spark(car.x + Math.cos(back) * 12, car.y + Math.sin(back) * 12, car.heading, tier);
+  }
+  if (!race.onTrack && car.speed > 60) {
+    if (Math.random() < 0.7) renderer.dirt(car.x, car.y, car.heading, car.speed);
+    renderer.kick(0.6);
+  }
+
+  maybeSkid(G.myId, car, input.brake, now);
+
+  const bar = $('boostBar');
+  const boosting = car.boostMs > 0;
+  bar.style.width = `${(boosting ? 1 : car.charge) * 100}%`;
+  bar.style.background = boosting ? '#ffffff' : TIER_COLOR[tier];
+  $('draftTag').classList.toggle('hidden', draft < 0.2);
+
+  sound.drive({
+    speed: car.speed,
+    boosting,
+    slip: Math.abs(car.slip),
+    draft,
+    live,
+  });
+}
+
+// Rubber goes down when a car is sliding sideways, or hauling on the brakes.
+function maybeSkid(id, c, braking, now) {
+  if (c.speed < 130) return;
+  const slip = Math.abs(angleDelta(c.heading, c.travel));
   let strength = Math.min(1, Math.max(0, (slip - SKID_SLIP) * 2.5));
-  if (braking && speed > 200) strength = Math.max(strength, 0.55);
-  if (strength > 0) renderer.skid(id, x, y, heading, now, strength);
+  if (braking && c.speed > 200) strength = Math.max(strength, 0.55);
+  if (strength > 0) renderer.skid(id, c.x, c.y, c.heading, now, strength);
 }
 
 function remoteCarAt(id, now) {
@@ -411,22 +645,22 @@ function renderStandings(now) {
       `<span class="sname">${escapeHtml(row.p.name)}</span>` +
       `<span class="slap">${row.fin != null ? '✓' : `L${Math.min((row.p.lap ?? 0) + 1, LAPS)}`}</span>`;
     el.append(div);
-    if (row.id === G.myId) $('posText').textContent = `P${i + 1}`;
+    if (row.id === G.myId) {
+      const place = i + 1;
+      $('posText').textContent = `P${place}`;
+      // Gaining a place mid-race is worth shouting about.
+      if (G.lastPos && place < G.lastPos && !G.race?.finished && !G.spectating) {
+        toast(`▲ P${place}`, '#69f0ae', 800);
+        sound.overtake();
+      }
+      G.lastPos = place;
+    }
   });
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-}
-
-const fmtTime = (ms) => {
-  const m = Math.floor(ms / 60000);
-  const s = ((ms % 60000) / 1000).toFixed(2);
-  return `${m}:${s.padStart(5, '0')}`;
-};
-
 function renderResults() {
   if (G.phase !== 'results' || !G.results) return;
+  $('resultTrack').textContent = TRACK.name;
   const tbody = $('resultRows');
   tbody.innerHTML = '';
   G.results.forEach((r, i) => {
@@ -442,7 +676,32 @@ function renderResults() {
       `<td>${r.best == null ? '—' : fmtTime(r.best)}</td>`;
     tbody.append(tr);
   });
+
+  const s = G.series;
+  $('seriesBox').classList.toggle('hidden', !s);
+  if (s) {
+    $('seriesTitle').textContent = `Championship · round ${s.round} of ${s.rounds}`;
+    const rows = $('seriesRows');
+    rows.innerHTML = '';
+    s.standings.forEach((row, i) => {
+      const tr = document.createElement('tr');
+      if (row.id === G.myId) tr.className = 'me';
+      tr.innerHTML =
+        `<td>${i + 1}</td>` +
+        `<td><span class="dot" style="background:${PALETTE[row.color % PALETTE.length]}"></span> ${escapeHtml(row.name)}</td>` +
+        `<td>${row.pts}</td>`;
+      rows.append(tr);
+    });
+    const champ = $('champion');
+    champ.classList.toggle('hidden', !s.complete || !s.standings.length);
+    if (s.complete && s.standings.length) {
+      champ.textContent = `🏆 ${s.standings[0].name} takes the title`;
+    }
+  }
+
   const isHost = G.myId === G.hostId;
+  const more = s && !s.complete;
+  $('againBtn').textContent = more ? `Next round · ${s.round + 1}/${s.rounds}` : 'Race again';
   $('againBtn').classList.toggle('hidden', !isHost);
   $('againWait').classList.toggle('hidden', isHost);
 }
@@ -462,24 +721,27 @@ function frame(now) {
   lastFrame = now;
   if (G.phase !== 'racing' || !G.race) return;
 
-  tickRace(now, dt);
-
+  // Remote cars first — the local car's slipstream depends on where they are.
   const cars = [];
   for (const [id] of G.remotes) {
     const pos = remoteCarAt(id, now);
     const p = G.players.get(id);
     if (!pos || !p) continue;
-    maybeSkid(id, pos.x, pos.y, pos.heading, pos.travel, pos.speed, false, now);
+    maybeSkid(id, pos, false, now);
     cars.push({ ...pos, id, color: PALETTE[p.color % PALETTE.length], name: p.name });
   }
 
-  let targetX, targetY;
+  tickRace(now, dt, cars);
+
+  let targetX, targetY, speedRatio = 0;
   if (!G.spectating) {
     const car = G.race.car;
+    speedRatio = Math.min(1, car.speed / 340);
     cars.push({
       x: car.x, y: car.y, heading: car.heading, id: G.myId,
       color: PALETTE[(G.players.get(G.myId)?.color ?? 0) % PALETTE.length],
       braking: input.brake, isMe: true,
+      charge: car.charge, tier: driftTier(car.charge), draft: car.draft,
     });
     // Lead the camera down the road so there is time to react at speed.
     targetX = car.x + Math.cos(car.travel) * car.speed * CAM_LEAD_S;
@@ -501,7 +763,7 @@ function frame(now) {
   const k = 1 - Math.exp(-CAM_SMOOTH * dt);
   G.cam.x += (targetX - G.cam.x) * k;
   G.cam.y += (targetY - G.cam.y) * k;
-  renderer.draw(G.cam.x, G.cam.y, cars, now);
+  renderer.draw(G.cam.x, G.cam.y, cars, now, { speedRatio });
 
   if (now - lastStandings > 500) {
     lastStandings = now;
@@ -572,12 +834,26 @@ for (const ev of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) {
 // ----------------------------------------------------------------------- UI
 
 $('nameInput').value = localStorage.getItem('racer-name') || '';
+buildPickers();
+renderSetup();
+
+function syncSoundBtn() {
+  $('soundBtn').textContent = sound.on ? '♪ SOUND' : '♪ MUTED';
+}
+syncSoundBtn();
+$('soundBtn').addEventListener('click', () => {
+  sound.unlock();
+  sound.setEnabled(!sound.on);
+  syncSoundBtn();
+});
 
 $('createBtn').addEventListener('click', () => {
+  sound.unlock();
   createTries = 0;
   connect(genCode(), true);
 });
 $('joinBtn').addEventListener('click', () => {
+  sound.unlock();
   const code = $('codeInput').value.trim().toUpperCase();
   if (/^[A-Z0-9]{4,8}$/.test(code)) connect(code);
   else $('codeInput').focus();

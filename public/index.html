@@ -21,7 +21,7 @@
     position: fixed; inset: 0; display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 14px; padding: 24px;
     background: radial-gradient(120% 100% at 50% 0%, #1d2230 0%, #14161c 70%);
-    z-index: 10; text-align: center;
+    z-index: 10; text-align: center; overflow-y: auto;
   }
   h1 { font-size: clamp(34px, 9vw, 56px); letter-spacing: 3px; font-style: italic; }
   h1 em { color: #ffd740; font-style: italic; }
@@ -45,7 +45,7 @@
   .divider { color: #565e70; font-size: 13px; letter-spacing: 2px; }
 
   #roomCode { font-size: 44px; letter-spacing: 10px; font-weight: 800; color: #ffd740; }
-  #playerList { list-style: none; display: flex; flex-direction: column; gap: 8px; min-height: 60px; }
+  #playerList { list-style: none; display: flex; flex-direction: column; gap: 8px; min-height: 40px; }
   #playerList li { font-size: 18px; display: flex; align-items: center; gap: 8px; justify-content: center; }
   .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; }
   .tag {
@@ -53,6 +53,24 @@
     border: 1px solid #343b4d; padding: 2px 7px; border-radius: 99px;
   }
   .wait { color: #9aa1b0; font-size: 15px; }
+
+  /* Race setup */
+  #setupBox { width: min(360px, 90vw); display: flex; flex-direction: column; gap: 8px; }
+  .pickLabel {
+    font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+    color: #6f7789; margin-top: 4px;
+  }
+  .pickRow { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; }
+  .pick {
+    width: auto; flex: 1 1 auto; min-width: 84px; padding: 9px 12px; font-size: 13px;
+    font-weight: 600; background: #1c202b; color: #c3c9d6; border: 1px solid #343b4d;
+    border-radius: 10px; line-height: 1.25;
+  }
+  .pick small { display: block; font-size: 10px; color: #6f7789; font-weight: 500; }
+  .pick.on { background: #ffd740; color: #191505; border-color: #ffd740; }
+  .pick.on small { color: #6b5a12; }
+  #setupInfo { font-size: 14px; }
+  #setupInfo b { color: #ffd740; }
 
   /* HUD */
   #hud { position: fixed; inset: 0; pointer-events: none; z-index: 5; }
@@ -66,6 +84,10 @@
   #lapTime, #bestLap { font-variant-numeric: tabular-nums; font-weight: 700; }
   #lapTime { font-size: 17px; margin-top: 2px; }
   #bestLap { font-size: 12px; color: #9aa1b0; letter-spacing: 0.5px; }
+  #trackTag {
+    font-size: 11px; color: #6f7789; letter-spacing: 1.5px; text-transform: uppercase;
+    margin-top: 4px;
+  }
   #standings {
     position: fixed; top: calc(10px + env(safe-area-inset-top)); right: 10px;
     display: flex; flex-direction: column; gap: 3px; font-size: 13px;
@@ -81,13 +103,50 @@
     font-size: clamp(70px, 22vw, 150px); font-weight: 900; font-style: italic;
     color: #ffd740; text-shadow: 0 4px 24px rgba(0,0,0,0.6);
   }
+  #lights {
+    position: fixed; top: 20dvh; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 10px; background: rgba(10,12,18,0.6); padding: 10px 14px;
+    border-radius: 16px;
+  }
+  #lights i {
+    width: 22px; height: 22px; border-radius: 50%; background: #2a2f3c;
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.6);
+  }
+  #lights i.on { background: #ff3b30; box-shadow: 0 0 14px rgba(255,59,48,0.8); }
   #banner, #wrongWay {
     position: fixed; left: 50%; transform: translateX(-50%);
-    top: calc(14px + env(safe-area-inset-top));
+    top: calc(44px + env(safe-area-inset-top));
     background: rgba(10,12,18,0.7); padding: 8px 18px; border-radius: 99px;
     font-weight: 700; font-size: 15px;
   }
   #wrongWay { top: auto; bottom: 30dvh; color: #ff5252; font-size: 22px; }
+
+  #toast {
+    position: fixed; top: 32dvh; left: 50%; transform: translateX(-50%);
+    font-size: clamp(22px, 6vw, 34px); font-weight: 900; font-style: italic;
+    letter-spacing: 1px; text-shadow: 0 3px 14px rgba(0,0,0,0.8);
+    white-space: nowrap; opacity: 0; transition: opacity 0.18s;
+  }
+  #toast.show { opacity: 1; }
+
+  /* Boost + slipstream */
+  #boostWrap {
+    position: fixed; bottom: 20dvh; left: 50%; transform: translateX(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 5px; width: 136px;
+  }
+  #boostTrack {
+    width: 100%; height: 9px; border-radius: 99px; background: rgba(10,12,18,0.6);
+    overflow: hidden; border: 1px solid rgba(255,255,255,0.09);
+  }
+  #boostBar { height: 100%; width: 0%; background: #fff; transition: background 0.1s; }
+  #boostWrap .cap {
+    font-size: 10px; letter-spacing: 2px; text-transform: uppercase; font-weight: 700;
+    color: rgba(236,238,242,0.55);
+  }
+  #draftTag {
+    font-size: 12px; letter-spacing: 2px; font-weight: 800; color: #7fdbff;
+    text-shadow: 0 0 12px rgba(127,219,255,0.7);
+  }
 
   .zone {
     position: fixed; bottom: 0; height: 34dvh; opacity: 0;
@@ -106,7 +165,7 @@
 
   /* Results */
   #results table { border-collapse: collapse; font-size: 17px; }
-  #results td, #results th { padding: 7px 14px; text-align: left; }
+  #results td, #results th { padding: 6px 12px; text-align: left; }
   #results th {
     font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
     color: #9aa1b0; font-weight: 600; border-bottom: 1px solid #343b4d;
@@ -115,12 +174,28 @@
   #results td:nth-child(3), #results td:nth-child(4) { font-variant-numeric: tabular-nums; }
   #results td:nth-child(4) { color: #9aa1b0; font-size: 15px; }
   #results tr.me td:nth-child(4) { color: #ffd740; }
+  #seriesBox {
+    border-top: 1px solid #343b4d; padding-top: 12px; margin-top: 4px;
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+  }
+  #seriesTitle { font-size: 12px; letter-spacing: 2px; text-transform: uppercase; color: #6f7789; }
+  #champion { font-size: 20px; font-weight: 800; color: #ffd740; }
+  #seriesTable td { padding: 4px 12px; font-size: 15px; }
+  #seriesTable td:last-child { font-weight: 800; color: #ffd740; font-variant-numeric: tabular-nums; }
+  #resultTrack { font-size: 13px; color: #9aa1b0; letter-spacing: 1px; }
 
   #netMsg {
     position: fixed; bottom: calc(12px + env(safe-area-inset-bottom)); left: 50%;
     transform: translateX(-50%); z-index: 20; background: rgba(10,12,18,0.85);
     border: 1px solid #343b4d; border-radius: 99px; padding: 7px 16px;
     font-size: 13px; color: #ffd740;
+  }
+  #soundBtn {
+    position: fixed; top: calc(8px + env(safe-area-inset-top)); left: 50%;
+    transform: translateX(-50%); z-index: 30; width: auto; padding: 5px 12px;
+    font-size: 12px; font-weight: 600; letter-spacing: 1px;
+    background: rgba(10,12,18,0.6); color: #9aa1b0; border: 1px solid #343b4d;
+    border-radius: 99px;
   }
 </style>
 </head>
@@ -133,15 +208,23 @@
     <div id="posText">P1</div>
     <div id="lapTime">0:00.00</div>
     <div id="bestLap">BEST —</div>
+    <div id="trackTag"></div>
   </div>
   <div id="standings"></div>
+  <div id="lights" class="hidden"><i></i><i></i><i></i><i></i><i></i></div>
   <div id="countdown" class="hidden"></div>
+  <div id="toast"></div>
   <div id="banner" class="hidden"></div>
   <div id="wrongWay" class="hidden">WRONG WAY!</div>
+  <div id="boostWrap">
+    <div id="draftTag" class="hidden">SLIPSTREAM</div>
+    <div id="boostTrack"><div id="boostBar"></div></div>
+    <div class="cap" id="boostCap">drift to charge</div>
+  </div>
   <div class="zone" id="zoneL">◀</div>
   <div class="zone" id="zoneB">BRAKE</div>
   <div class="zone" id="zoneR">▶</div>
-  <div class="hint">hold left / right to steer · middle to brake · gas is automatic</div>
+  <div class="hint">hold left / right to steer · middle to brake &amp; drift</div>
 </div>
 
 <div id="menu" class="screen">
@@ -161,16 +244,29 @@
   <div id="roomCode"></div>
   <button id="shareBtn" class="secondary">Share link</button>
   <ul id="playerList"></ul>
-  <button id="startBtn" class="hidden">Start race · 3 laps</button>
+  <div id="setupBox" class="hidden">
+    <div class="pickLabel">circuit</div>
+    <div class="pickRow" id="trackPick"></div>
+    <div class="pickLabel">length</div>
+    <div class="pickRow" id="roundPick"></div>
+  </div>
+  <div id="setupInfo" class="wait"></div>
+  <button id="startBtn" class="hidden">Start race</button>
   <div id="waitMsg" class="wait">Waiting for the host to start…</div>
 </div>
 
 <div id="results" class="screen hidden">
   <h1>RESULTS</h1>
+  <div id="resultTrack"></div>
   <table>
     <thead><tr><th></th><th>Racer</th><th>Time</th><th>Best lap</th></tr></thead>
     <tbody id="resultRows"></tbody>
   </table>
+  <div id="seriesBox" class="hidden">
+    <div id="seriesTitle"></div>
+    <div id="champion" class="hidden"></div>
+    <table><tbody id="seriesRows"></tbody></table>
+  </div>
   <button id="againBtn" class="hidden">Race again</button>
   <div id="againWait" class="wait">Waiting for the host…</div>
 </div>
@@ -182,6 +278,7 @@
 </div>
 
 <div id="netMsg" class="hidden"></div>
+<button id="soundBtn" class="secondary">♪ SOUND</button>
 
 <script type="module" src="/js/main.js"></script>
 </body>

@@ -1,9 +1,10 @@
-// Canvas renderer. The track (grass, asphalt, markings) never changes, so it
-// is drawn once into an offscreen canvas and blitted with the camera
-// transform each frame; only cars and labels are drawn per frame.
+// Canvas renderer. The track (ground, asphalt, markings) never changes while
+// a race is running, so it is drawn once into an offscreen canvas and blitted
+// with the camera transform each frame; only cars, effects and labels are
+// drawn per frame.
 
-import { TRACK, TRACK_WIDTH, pointAt } from './track.js';
-import { CAR } from './car.js';
+import { TRACK, pointAt } from './track.js';
+import { CAR, TIER_COLOR } from './car.js';
 
 export const PALETTE = [
   '#ff5252', '#40c4ff', '#ffd740', '#69f0ae',
@@ -21,6 +22,8 @@ const SKID_MAX = 800;
 const SKID_STEP_MS = 30; // how often one car lays down a new pair of marks
 const SKID_BUCKETS = 4;
 
+const PARTICLE_MAX = 400;
+
 export class Renderer {
   constructor(canvas) {
     this.canvas = canvas;
@@ -28,6 +31,15 @@ export class Renderer {
     this.marks = [];
     this.skidAt = new Map(); // car id -> last emit time
     this.skidPrev = new Map(); // `id:side` -> last wheel position
+    this.parts = [];
+    this.shake = 0;
+    this.lastNow = 0;
+    this.useTrack();
+    this.resize();
+  }
+
+  // Rebuild everything that is baked per circuit. Called on every track swap.
+  useTrack() {
     const b = TRACK.bounds;
     this.world = {
       x: b.minX - WORLD_MARGIN,
@@ -36,7 +48,8 @@ export class Renderer {
       h: b.maxY - b.minY + WORLD_MARGIN * 2,
     };
     this.static = this.buildStaticLayer();
-    this.resize();
+    this.clearSkids();
+    this.parts.length = 0;
   }
 
   resize() {
@@ -50,19 +63,20 @@ export class Renderer {
   }
 
   buildStaticLayer() {
+    const theme = TRACK.theme;
     const c = document.createElement('canvas');
     c.width = Math.ceil(this.world.w);
     c.height = Math.ceil(this.world.h);
     const g = c.getContext('2d');
     g.translate(-this.world.x, -this.world.y);
 
-    // Grass with a little texture so motion is visible off-track.
-    g.fillStyle = '#2b5231';
+    // Ground with a little texture so motion is visible off-track.
+    g.fillStyle = theme.ground;
     g.fillRect(this.world.x, this.world.y, this.world.w, this.world.h);
     for (let i = 0; i < 900; i++) {
       const x = this.world.x + Math.random() * this.world.w;
       const y = this.world.y + Math.random() * this.world.h;
-      g.fillStyle = Math.random() < 0.5 ? '#26492c' : '#315c38';
+      g.fillStyle = theme.groundAlt[Math.random() < 0.5 ? 0 : 1];
       g.fillRect(x, y, 5 + Math.random() * 9, 5 + Math.random() * 9);
     }
 
@@ -73,14 +87,14 @@ export class Renderer {
     g.lineJoin = 'round';
     g.lineCap = 'round';
     // Edge lines, then asphalt on top.
-    g.strokeStyle = '#dcdce2';
-    g.lineWidth = TRACK_WIDTH + 12;
+    g.strokeStyle = theme.edge;
+    g.lineWidth = TRACK.width + 12;
     g.stroke(path);
-    g.strokeStyle = '#3a3d46';
-    g.lineWidth = TRACK_WIDTH;
+    g.strokeStyle = theme.road;
+    g.lineWidth = TRACK.width;
     g.stroke(path);
     // Dashed centerline.
-    g.strokeStyle = 'rgba(220,220,226,0.28)';
+    g.strokeStyle = theme.mid;
     g.setLineDash([16, 30]);
     g.lineWidth = 3;
     g.stroke(path);
@@ -90,7 +104,7 @@ export class Renderer {
     const p0 = pointAt(0);
     const nx = -Math.sin(p0.ang), ny = Math.cos(p0.ang);
     const tx = Math.cos(p0.ang), ty = Math.sin(p0.ang);
-    const sq = 8, cols = 2, rows = Math.floor(TRACK_WIDTH / sq);
+    const sq = 8, cols = 2, rows = Math.floor(TRACK.width / sq);
     for (let cI = 0; cI < cols; cI++) {
       for (let r = 0; r < rows; r++) {
         g.fillStyle = (cI + r) % 2 === 0 ? '#f2f2f5' : '#17181d';
@@ -105,6 +119,8 @@ export class Renderer {
     }
     return c;
   }
+
+  // ------------------------------------------------------------- skid marks
 
   clearSkids() {
     this.marks.length = 0;
@@ -153,18 +169,136 @@ export class Renderer {
     }
   }
 
-  // cars: [{x, y, heading, color, name, braking, isMe}]
-  draw(camX, camY, cars, now) {
-    const { ctx, dpr, zoom } = this;
+  // -------------------------------------------------------------- particles
+
+  spawn(x, y, vx, vy, life, size, color, grow = 0) {
+    if (this.parts.length >= PARTICLE_MAX) this.parts.shift();
+    this.parts.push({ x, y, vx, vy, life, max: life, size, color, grow });
+  }
+
+  // Dirt kicked up by a car running off the asphalt.
+  dirt(x, y, heading, speed) {
+    const back = heading + Math.PI;
+    const spread = (Math.random() - 0.5) * 1.4;
+    const v = 30 + speed * 0.25;
+    this.spawn(
+      x + (Math.random() - 0.5) * 12,
+      y + (Math.random() - 0.5) * 12,
+      Math.cos(back + spread) * v,
+      Math.sin(back + spread) * v,
+      0.5 + Math.random() * 0.3,
+      3 + Math.random() * 4,
+      TRACK.theme.groundAlt[Math.random() < 0.5 ? 0 : 1],
+      14
+    );
+  }
+
+  // Exhaust flame while the turbo is lit.
+  flame(x, y, heading, tier) {
+    const back = heading + Math.PI;
+    const spread = (Math.random() - 0.5) * 0.5;
+    const v = 60 + Math.random() * 90;
+    this.spawn(
+      x + Math.cos(back) * CAR.LEN * 0.5,
+      y + Math.sin(back) * CAR.LEN * 0.5,
+      Math.cos(back + spread) * v,
+      Math.sin(back + spread) * v,
+      0.28 + Math.random() * 0.18,
+      4 + Math.random() * 5,
+      Math.random() < 0.45 ? '#fff3c4' : TIER_COLOR[tier] || '#ffab40',
+      -6
+    );
+  }
+
+  // Sparks off the tyres as a drift charges up.
+  spark(x, y, heading, tier) {
+    const back = heading + Math.PI;
+    const spread = (Math.random() - 0.5) * 1.8;
+    const v = 70 + Math.random() * 120;
+    this.spawn(
+      x, y,
+      Math.cos(back + spread) * v,
+      Math.sin(back + spread) * v,
+      0.18 + Math.random() * 0.16,
+      2 + Math.random() * 2.5,
+      TIER_COLOR[tier],
+      -4
+    );
+  }
+
+  burst(x, y, tier) {
+    for (let i = 0; i < 16; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const v = 60 + Math.random() * 170;
+      this.spawn(x, y, Math.cos(a) * v, Math.sin(a) * v,
+        0.3 + Math.random() * 0.25, 3 + Math.random() * 4, TIER_COLOR[tier], -5);
+    }
+  }
+
+  stepParticles(dt) {
+    const parts = this.parts;
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i];
+      p.life -= dt;
+      if (p.life <= 0) {
+        parts.splice(i, 1);
+        continue;
+      }
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vx *= 1 - 2.6 * dt;
+      p.vy *= 1 - 2.6 * dt;
+      p.size = Math.max(0.5, p.size + p.grow * dt);
+    }
+  }
+
+  drawParticles(ctx) {
+    for (const p of this.parts) {
+      ctx.globalAlpha = Math.max(0, Math.min(1, p.life / p.max));
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  kick(amount) {
+    this.shake = Math.min(26, this.shake + amount);
+  }
+
+  // ------------------------------------------------------------------ frame
+
+  // cars: [{x, y, heading, color, name, braking, isMe, boosting, charge,
+  //         tier, draft}]
+  draw(camX, camY, cars, now, opts = {}) {
+    const dt = this.lastNow ? Math.min(0.05, (now - this.lastNow) / 1000) : 0.016;
+    this.lastNow = now;
+    this.stepParticles(dt);
+
+    const { ctx, dpr } = this;
     const vw = this.cssW, vh = this.cssH;
+    const speedRatio = opts.speedRatio || 0;
+    // Pull the camera back as the car winds up — the road arrives faster and
+    // you can see more of what is coming.
+    const zoom = this.zoom * (1 - 0.13 * speedRatio);
 
     // Clamp the camera so we never show past the world edge.
     const halfW = vw / 2 / zoom, halfH = vh / 2 / zoom;
-    camX = Math.max(this.world.x + halfW, Math.min(this.world.x + this.world.w - halfW, camX));
-    camY = Math.max(this.world.y + halfH, Math.min(this.world.y + this.world.h - halfH, camY));
+    const wx = this.world.x, wy = this.world.y;
+    camX = Math.max(wx + halfW, Math.min(wx + this.world.w - halfW, camX));
+    camY = Math.max(wy + halfH, Math.min(wy + this.world.h - halfH, camY));
+
+    if (this.shake > 0.2) {
+      camX += (Math.random() - 0.5) * this.shake;
+      camY += (Math.random() - 0.5) * this.shake;
+      this.shake *= Math.max(0, 1 - 7 * dt);
+    } else {
+      this.shake = 0;
+    }
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#1c3521';
+    ctx.fillStyle = TRACK.theme.void;
     ctx.fillRect(0, 0, vw, vh);
 
     ctx.save();
@@ -174,6 +308,7 @@ export class Renderer {
     ctx.imageSmoothingEnabled = true;
     ctx.drawImage(this.static, this.world.x, this.world.y);
     this.drawSkids(ctx, now);
+    this.drawParticles(ctx);
 
     for (const car of cars) this.drawCar(ctx, car);
 
@@ -190,13 +325,63 @@ export class Renderer {
       ctx.fillText(car.name, car.x, car.y - 30);
     }
     ctx.restore();
+
+    if (speedRatio > 0.8) this.drawSpeedLines(ctx, vw, vh, speedRatio);
+  }
+
+  // Screen-space streaks that only show up when the car is really flying.
+  drawSpeedLines(ctx, vw, vh, ratio) {
+    const strength = (ratio - 0.8) / 0.2;
+    ctx.save();
+    ctx.strokeStyle = `rgba(255,255,255,${0.05 + strength * 0.09})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < 14; i++) {
+      const edge = i % 2 === 0 ? 1 : -1;
+      const x = vw / 2 + edge * (vw * 0.28 + Math.random() * vw * 0.22);
+      const y = Math.random() * vh;
+      const len = 40 + Math.random() * 90 * strength;
+      ctx.moveTo(x, y);
+      ctx.lineTo(x, y + len);
+    }
+    ctx.stroke();
+    ctx.restore();
   }
 
   drawCar(ctx, car) {
     const { LEN, WID } = CAR;
+    // Slipstream: streaks pulled off the car you are tucked in behind.
+    if (car.draft > 0.15) {
+      ctx.save();
+      ctx.translate(car.x, car.y);
+      ctx.rotate(car.heading);
+      ctx.strokeStyle = `rgba(200,235,255,${0.12 + car.draft * 0.3})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let i = -1; i <= 1; i += 2) {
+        const oy = i * (WID / 2 + 3);
+        ctx.moveTo(-LEN * 0.4, oy);
+        ctx.lineTo(-LEN * 0.4 - 22 - car.draft * 26, oy);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
     ctx.save();
     ctx.translate(car.x, car.y);
     ctx.rotate(car.heading);
+
+    // Charge glow builds under the car as a drift is held.
+    if (car.charge > 0.05) {
+      const tier = car.tier || 0;
+      ctx.fillStyle = TIER_COLOR[tier] || '#ffffff';
+      ctx.globalAlpha = 0.14 + car.charge * 0.3;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, LEN * 0.85, WID * 0.95, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
     // Shadow
     ctx.fillStyle = 'rgba(0,0,0,0.3)';
     ctx.beginPath();
