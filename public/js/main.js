@@ -13,7 +13,7 @@ const CAM_LEAD_S = 0.26; // camera looks this far up the road
 const CAM_SMOOTH = 7; // camera catch-up rate; higher is tighter
 const HUD_INTERVAL_MS = 60;
 const SKID_SLIP = 0.22; // radians of slide before the tyres start marking
-const LIGHT_STEP_MS = 800; // one start light per this long
+const LIGHT_STEP_MS = 1200; // one start light per this long
 const ROUND_CHOICES = [1, 3, 5];
 
 // Slipstream: how close, how directly in front, and how aligned another car
@@ -353,6 +353,7 @@ function startRace(startIn, order, track) {
     wrongWayDist: 0,
     finished: false,
     finishMs: null,
+    watching: null, // who the camera follows once we've taken the flag
     lapStartAt: performance.now() + startIn,
     bestLap: null,
     boostTier: 1,
@@ -377,18 +378,24 @@ function startRace(startIn, order, track) {
   sound.unlock();
 }
 
-// F1-style start lights: they come on one at a time, then all go out at once.
+// Three start lights: two reds come on in turn, then they drop out and the
+// last lamp goes green on the flag.
 function updateLights(race, left) {
   const lights = $('lights');
+  const bulbs = lights.children;
   const cd = $('countdown');
   if (left > 0) {
-    const on = Math.max(0, Math.min(5, Math.floor((race.startIn - left) / LIGHT_STEP_MS)));
-    if (on !== race.lights) {
-      race.lights = on;
-      if (on > 0) { sound.light(false); buzz(12); }
+    const reds = Math.min(bulbs.length - 1, 1 + Math.floor((race.startIn - left) / LIGHT_STEP_MS));
+    if (reds !== race.lights) {
+      race.lights = reds;
+      sound.light(false);
+      buzz(12);
     }
     lights.classList.remove('hidden');
-    [...lights.children].forEach((el, i) => el.classList.toggle('on', i < on));
+    for (let i = 0; i < bulbs.length; i++) {
+      bulbs[i].classList.toggle('on', i < reds);
+      bulbs[i].classList.remove('go');
+    }
     cd.classList.add('hidden');
     return;
   }
@@ -398,11 +405,16 @@ function updateLights(race, left) {
     buzz([0, 40]);
     renderer.kick(7);
   }
-  lights.classList.add('hidden');
+  for (let i = 0; i < bulbs.length; i++) {
+    bulbs[i].classList.remove('on');
+    bulbs[i].classList.toggle('go', i === bulbs.length - 1);
+  }
   if (left > -900) {
+    lights.classList.remove('hidden');
     cd.classList.remove('hidden');
     cd.textContent = 'GO!';
   } else {
+    lights.classList.add('hidden');
     cd.classList.add('hidden');
   }
 }
@@ -658,6 +670,30 @@ function renderStandings(now) {
   });
 }
 
+// The next car due to take the flag: furthest along of those still running.
+function pickFollow(cars, now) {
+  let bestId = null, bestProg = -Infinity;
+  for (const [id] of G.remotes) {
+    const prog = totalProgress(id, now);
+    if (prog === Infinity) continue; // already finished
+    if (prog > bestProg) {
+      bestProg = prog;
+      bestId = id;
+    }
+  }
+  return cars.find((c) => c.id === bestId) || null;
+}
+
+function showWatching(race, follow) {
+  const id = follow && !follow.isMe ? follow.id : null;
+  if (id === race.watching) return;
+  race.watching = id;
+  const done = `Finished — ${fmtTime(race.finishMs)}`;
+  const who = id ? G.players.get(id)?.name : null;
+  $('banner').textContent = who ? `${done} · watching ${who}` : done;
+  $('banner').classList.remove('hidden');
+}
+
 function renderResults() {
   if (G.phase !== 'results' || !G.results) return;
   $('resultTrack').textContent = TRACK.name;
@@ -733,33 +769,31 @@ function frame(now) {
 
   tickRace(now, dt, cars);
 
-  let targetX, targetY, speedRatio = 0;
+  let myEntry = null;
   if (!G.spectating) {
     const car = G.race.car;
-    speedRatio = Math.min(1, car.speed / 340);
-    cars.push({
-      x: car.x, y: car.y, heading: car.heading, id: G.myId,
+    myEntry = {
+      x: car.x, y: car.y, heading: car.heading, travel: car.travel,
+      speed: car.speed, id: G.myId,
       color: PALETTE[(G.players.get(G.myId)?.color ?? 0) % PALETTE.length],
       braking: input.brake, isMe: true,
       charge: car.charge, tier: driftTier(car.charge), draft: car.draft,
-    });
-    // Lead the camera down the road so there is time to react at speed.
-    targetX = car.x + Math.cos(car.travel) * car.speed * CAM_LEAD_S;
-    targetY = car.y + Math.sin(car.travel) * car.speed * CAM_LEAD_S;
-  } else {
-    // Spectate whoever is furthest along.
-    let bestId = null, bestProg = -Infinity;
-    for (const [id] of G.remotes) {
-      const prog = totalProgress(id, now);
-      if (prog !== Infinity && prog > bestProg) {
-        bestProg = prog;
-        bestId = id;
-      }
-    }
-    const lead = cars.find((c) => c.id === bestId) || cars[0];
-    targetX = lead ? lead.x : TRACK.pts[0][0];
-    targetY = lead ? lead.y : TRACK.pts[0][1];
+    };
+    cars.push(myEntry);
   }
+
+  // Once you've taken the flag there is nothing left to drive, so hand the
+  // camera to whoever is still out there — otherwise you sit watching your own
+  // parked car for up to the full 45s cutoff.
+  const watching = G.spectating || G.race.finished;
+  const follow = (watching ? pickFollow(cars, now) : myEntry) || myEntry || cars[0];
+  if (!G.spectating && G.race.finished) showWatching(G.race, follow);
+  $('boostWrap').classList.toggle('hidden', watching);
+
+  const speedRatio = follow ? Math.min(1, follow.speed / 340) : 0;
+  // Lead the camera down the road so there is time to react at speed.
+  const targetX = follow ? follow.x + Math.cos(follow.travel) * follow.speed * CAM_LEAD_S : TRACK.pts[0][0];
+  const targetY = follow ? follow.y + Math.sin(follow.travel) * follow.speed * CAM_LEAD_S : TRACK.pts[0][1];
   const k = 1 - Math.exp(-CAM_SMOOTH * dt);
   G.cam.x += (targetX - G.cam.x) * k;
   G.cam.y += (targetY - G.cam.y) * k;

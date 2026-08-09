@@ -19,11 +19,12 @@ taps it is on the starting grid.
   down to 8th, live standings between races and a champion at the end.
 - **Rooms with 4-letter codes** — up to 8 players, first player in is the host.
 - **Lap timing** with best-lap and per-circuit personal bests, live standings,
-  a finish cutoff, and a results screen.
+  a finish cutoff, and a results screen. Take the flag early and the camera
+  follows whoever is still out there instead of your parked car.
 - **Survives a dropped signal** — lock your phone or walk into a tunnel and the
   client reconnects and climbs back into the same car, mid-race.
-- Start lights, skid marks, dirt, exhaust flames, camera shake, haptics and a
-  fully synthesised engine (no audio files to download).
+- Two red start lights and a green, skid marks, dirt, exhaust flames, camera
+  shake, haptics and a fully synthesised engine (no audio files to download).
 
 ## How it works
 

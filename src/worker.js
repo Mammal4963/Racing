@@ -8,7 +8,7 @@
 
 const MAX_PLAYERS = 8;
 const FINISH_CUTOFF_MS = 45_000; // once someone finishes, others get this long
-const COUNTDOWN_MS = 5_200; // long enough for five start lights
+const COUNTDOWN_MS = 3_600; // two red lights, a pause, then green
 const RESUME_GRACE_MS = 25_000; // a dropped phone can reclaim its car for this long
 const TRACK_COUNT = 4; // keep in step with LAYOUTS in public/js/track.js
 const ROUND_CHOICES = [1, 3, 5];

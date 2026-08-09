@@ -325,27 +325,6 @@ export class Renderer {
       ctx.fillText(car.name, car.x, car.y - 30);
     }
     ctx.restore();
-
-    if (speedRatio > 0.8) this.drawSpeedLines(ctx, vw, vh, speedRatio);
-  }
-
-  // Screen-space streaks that only show up when the car is really flying.
-  drawSpeedLines(ctx, vw, vh, ratio) {
-    const strength = (ratio - 0.8) / 0.2;
-    ctx.save();
-    ctx.strokeStyle = `rgba(255,255,255,${0.05 + strength * 0.09})`;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    for (let i = 0; i < 14; i++) {
-      const edge = i % 2 === 0 ? 1 : -1;
-      const x = vw / 2 + edge * (vw * 0.28 + Math.random() * vw * 0.22);
-      const y = Math.random() * vh;
-      const len = 40 + Math.random() * 90 * strength;
-      ctx.moveTo(x, y);
-      ctx.lineTo(x, y + len);
-    }
-    ctx.stroke();
-    ctx.restore();
   }
 
   drawCar(ctx, car) {

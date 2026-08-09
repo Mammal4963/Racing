@@ -46,9 +46,18 @@ await p1.waitForFunction(() => window.__game.phase === 'racing', null, { timeout
 await p2.waitForFunction(() => window.__game.phase === 'racing', null, { timeout: 5000 });
 ok('both clients entered racing phase');
 
-// Start lights should come on one at a time before the green.
-await p1.waitForFunction(() => document.querySelectorAll('#lights i.on').length >= 2, null, { timeout: 6000 });
-ok(`start lights sequencing (${await p1.$$eval('#lights i.on', (e) => e.length)}/5 lit)`);
+// Three start lights: two reds come on in turn, then the last goes green.
+const bulbs = await p1.$$eval('#lights i', (e) => e.length);
+if (bulbs !== 3) fail(`expected 3 start lights, found ${bulbs}`);
+await p1.waitForFunction(() => document.querySelectorAll('#lights i.on').length === 2, null, { timeout: 6000 });
+ok('start lights: two reds lit');
+await p1.waitForFunction(
+  () => document.querySelectorAll('#lights i.go').length === 1 &&
+        document.querySelectorAll('#lights i.on').length === 0,
+  null,
+  { timeout: 6000 }
+);
+ok('start lights: reds drop out and the last lamp goes green');
 
 // --- Wait out the countdown, hold no keys: auto-accelerate should move cars.
 await p1.waitForFunction(() => performance.now() > window.__game.race.startAt + 500, null, { timeout: 8000 });
@@ -238,6 +247,46 @@ const res2 = await p2.evaluate(() => window.__game.phase);
 if (res1 !== 'results' || res2 !== 'results') fail(`race did not end: p1=${res1} p2=${res2}`);
 ok('race completed → results phase on both clients');
 
+// --- Finishing first should hand the camera to whoever is still running,
+// rather than parking it on your own stopped car.
+// Carol has seen enough; from here on it is just the two racers, so a round
+// isn't left waiting on a car nobody is driving.
+await p3.context().close();
+await p1.click('#againBtn');
+await p1.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
+await p1.waitForFunction(() => document.querySelectorAll('#playerList li').length === 2, null, { timeout: 8000 });
+await p1.click('#startBtn');
+for (const page of [p1, p2]) {
+  await page.waitForFunction(() => window.__game.phase === 'racing', null, { timeout: 8000 });
+  await page.waitForFunction(() => performance.now() > window.__game.race.startAt, null, { timeout: 12000 });
+}
+// Send p1 to the flag on its own; p2 keeps driving.
+for (let i = 0; i < 260 && !(await p1.evaluate(() => window.__game.race.finished)); i++) {
+  await p1.evaluate(() => window.__hop());
+  await p1.waitForTimeout(30);
+}
+if (!(await p1.evaluate(() => window.__game.race.finished))) fail('p1 never finished');
+await p1.waitForTimeout(400);
+const watch = await p1.evaluate(() => ({
+  watching: window.__game.race.watching,
+  banner: document.getElementById('banner').textContent,
+  meterHidden: document.getElementById('boostWrap').classList.contains('hidden'),
+  myX: Math.round(window.__game.race.car.x),
+  camX: Math.round(window.__game.cam.x),
+}));
+if (!watch.watching) fail(`camera did not pick up another racer: ${JSON.stringify(watch)}`);
+if (!/watching /.test(watch.banner)) fail(`no spectate banner: "${watch.banner}"`);
+if (!watch.meterHidden) fail('boost meter still showing after finishing');
+ok(`finishing hands the camera to the next racer ("${watch.banner}")`);
+
+// Let p2 finish so the room lands back on results for the rest of the run.
+for (let i = 0; i < 260 && !(await p1.evaluate(() => window.__game.phase === 'results')); i++) {
+  await p2.evaluate(() => window.__hop());
+  await p2.waitForTimeout(30);
+}
+if (await p1.evaluate(() => window.__game.phase !== 'results')) fail('second race never ended');
+ok('second race completed');
+
 const rows = await p1.$$eval('#resultRows tr', (trs) => trs.map((tr) => tr.textContent.trim()));
 if (rows.length !== 2) fail(`expected 2 result rows, got ${rows.length}: ${rows}`);
 if (rows.some((r) => r.includes('DNF'))) fail(`spectator scored as DNF: ${rows}`);
@@ -255,10 +304,6 @@ await p2.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
 ok('race again returns both clients to lobby');
 
 // --- Championship: points, standings, and a new circuit each round.
-// Carol leaves first so the round doesn't wait on a car nobody is driving.
-await p3.context().close();
-await p1.waitForFunction(() => document.querySelectorAll('#playerList li').length === 2, null, { timeout: 8000 });
-
 await p1.click('#roundPick .pick:nth-child(2)'); // 3 rounds
 await p2.waitForFunction(() => window.__game.setup.rounds === 3, null, { timeout: 5000 });
 ok('host race setup propagates to the other players');
