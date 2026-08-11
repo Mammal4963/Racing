@@ -10,6 +10,7 @@
 // triangles, and the project has no build step to hang a dependency off.
 
 import { TRACK, project, pointAt } from './track.js';
+import { CAR, TIER_COLOR } from './car.js';
 import { perspective, lookAt, multiply, carModel, identity } from './glmath.js';
 
 // --------------------------------------------------------------- height field
@@ -348,6 +349,33 @@ void main() {
   frag = vec4(0.0, 0.0, 0.0, a);
 }`;
 
+// Skid marks and particles share one unlit, blended, vertex-coloured pass.
+const FX_VERT = `#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aColor;
+layout(location = 2) in float aAlpha;
+layout(location = 3) in vec2 aUV;
+uniform mat4 uViewProj;
+out vec3 vColor; out float vAlpha; out vec3 vWorld; out vec2 vUV;
+void main() {
+  vColor = aColor; vAlpha = aAlpha; vWorld = aPos; vUV = aUV;
+  gl_Position = uViewProj * vec4(aPos, 1.0);
+}`;
+
+const FX_FRAG = `#version 300 es
+precision highp float;
+in vec3 vColor; in float vAlpha; in vec3 vWorld; in vec2 vUV;
+uniform vec3 uFog; uniform float uFogDensity; uniform vec3 uEye;
+out vec4 frag;
+void main() {
+  // Particles carry corner UVs and come out round; skid quads pass (0,0) on
+  // every corner, so the falloff is a no-op and they stay square.
+  float fall = 1.0 - smoothstep(0.55, 1.0, length(vUV));
+  float dist = length(vWorld - uEye);
+  float f = 1.0 - exp(-uFogDensity * dist);
+  frag = vec4(mix(vColor, uFog, clamp(f, 0.0, 0.92)), vAlpha * fall);
+}`;
+
 const SKY_VERT = `#version 300 es
 out vec2 vNdc;
 void main() {
@@ -384,6 +412,14 @@ const hex = (h) => [
   parseInt(h.slice(5, 7), 16) / 255,
 ];
 
+const SKID_LIFE_MS = 4200;
+const SKID_MAX = 700;
+const SKID_STEP_MS = 30;
+const SKID_WIDTH = 2.8;
+const PARTICLE_MAX = 340;
+const MAX_QUADS = SKID_MAX + PARTICLE_MAX;
+const CAM_LERP = 8; // camera catch-up rate
+
 export class Renderer3D {
   constructor(canvas) {
     this.canvas = canvas;
@@ -391,11 +427,14 @@ export class Renderer3D {
     if (!gl) throw new Error('WebGL2 unavailable');
     this.gl = gl;
     gl.enable(gl.DEPTH_TEST);
+
     this.progTerrain = this.program(VERT, TERRAIN_FRAG);
     this.progRoad = this.program(VERT, ROAD_FRAG);
     this.progCar = this.program(CAR_VERT, CAR_FRAG);
     this.progSky = this.program(SKY_VERT, SKY_FRAG);
     this.progShadow = this.program(SHADOW_VERT, SHADOW_FRAG);
+    this.progFx = this.program(FX_VERT, FX_FRAG);
+
     this.car = this.upload(buildCarMesh(), [3, 3, 3, 1], gl.UNSIGNED_SHORT);
     this.shadow = this.upload({
       data: new Float32Array([
@@ -405,7 +444,19 @@ export class Renderer3D {
       index: new Uint16Array([0, 1, 2, 0, 2, 3]),
     }, [3, 2], gl.UNSIGNED_SHORT);
     this.emptyVao = gl.createVertexArray();
+    this.buildFxBuffers();
+
+    this.marks = [];
+    this.skidAt = new Map();
+    this.skidPrev = new Map();
+    this.parts = [];
+    this.shake = 0;
+    this.lastNow = 0;
+    this.camName = 'sweep';
     this.heightScale = 1;
+    this.cam = null; // smoothed {eye, target}
+    this.labels = [];
+    this.resize();
   }
 
   program(vsrc, fsrc) {
@@ -454,8 +505,39 @@ export class Renderer3D {
     return { vao, count: mesh.index.length, type: indexType || gl.UNSIGNED_INT };
   }
 
+  // One dynamic quad buffer, refilled each frame, for skids and particles.
+  buildFxBuffers() {
+    const gl = this.gl;
+    this.fxData = new Float32Array(MAX_QUADS * 4 * 9);
+    const idx = new Uint16Array(MAX_QUADS * 6);
+    for (let q = 0; q < MAX_QUADS; q++) {
+      const v = q * 4, o = q * 6;
+      idx[o] = v; idx[o + 1] = v + 1; idx[o + 2] = v + 2;
+      idx[o + 3] = v; idx[o + 4] = v + 2; idx[o + 5] = v + 3;
+    }
+    this.fxVao = gl.createVertexArray();
+    gl.bindVertexArray(this.fxVao);
+    this.fxVbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.fxVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, this.fxData.byteLength, gl.DYNAMIC_DRAW);
+    [3, 3, 1, 2].forEach((size, i) => {
+      gl.enableVertexAttribArray(i);
+      gl.vertexAttribPointer(i, size, gl.FLOAT, false, 36, [0, 12, 24, 28][i]);
+    });
+    const ibo = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+  }
+
+  setCamera(name) {
+    if (!CAMERAS[name]) return;
+    this.camName = name;
+    this.cam = null; // re-frame instantly rather than swooping across
+  }
+
   // Rebuild everything baked per circuit. heightScale 0 = flat, 1 = full relief.
-  useTrack(heightScale = 1) {
+  useTrack(heightScale = this.heightScale) {
     this.heightScale = heightScale;
     bankTable = buildBanking(heightScale);
     this.road = this.upload(buildRoadMesh(heightScale), [3, 3, 2]);
@@ -470,43 +552,184 @@ export class Renderer3D {
       skyTop: hex(t.sky ? t.sky[0] : t.void),
       skyHorizon: hex(t.sky ? t.sky[1] : t.void),
     };
+    this.clearSkids();
+    this.cam = null;
   }
 
   resize() {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    this.canvas.width = Math.round(window.innerWidth * dpr);
-    this.canvas.height = Math.round(window.innerHeight * dpr);
+    this.cssW = window.innerWidth;
+    this.cssH = window.innerHeight;
+    this.canvas.width = Math.round(this.cssW * dpr);
+    this.canvas.height = Math.round(this.cssH * dpr);
   }
 
-  // cars: [{x, y, heading, travel, color, isMe}]  follow: one of them
-  draw(cars, follow, camName = 'chase') {
+  groundY(x, z) {
+    return surfaceUnder(x, z, this.heightScale).y;
+  }
+
+  // ------------------------------------------------------------- effects
+
+  clearSkids() {
+    this.marks.length = 0;
+    this.skidAt.clear();
+    this.skidPrev.clear();
+    this.parts.length = 0;
+  }
+
+  kick(amount) {
+    this.shake = Math.min(26, this.shake + amount);
+  }
+
+  skid(id, x, z, heading, now, strength) {
+    if (now - (this.skidAt.get(id) || 0) < SKID_STEP_MS) return;
+    this.skidAt.set(id, now);
+    const cos = Math.cos(heading), sin = Math.sin(heading);
+    const bx = x - cos * CAR.LEN * 0.3, bz = z - sin * CAR.LEN * 0.3;
+    const ox = -sin * (CAR.WID / 2 - 1), oz = cos * (CAR.WID / 2 - 1);
+    for (const side of [-1, 1]) {
+      const px = bx + ox * side, pz = bz + oz * side;
+      const key = `${id}:${side}`;
+      const prev = this.skidPrev.get(key);
+      // Height is baked in once — the mark never moves again.
+      const py = this.groundY(px, pz) + 0.6;
+      this.skidPrev.set(key, { x: px, y: py, z: pz, t: now });
+      if (!prev || now - prev.t > 140) continue;
+      const d2 = (px - prev.x) ** 2 + (pz - prev.z) ** 2;
+      if (d2 < 1 || d2 > 8100) continue;
+      this.marks.push({
+        x1: prev.x, y1: prev.y, z1: prev.z,
+        x2: px, y2: py, z2: pz, born: now, s: strength,
+      });
+    }
+    while (this.marks.length > SKID_MAX) this.marks.shift();
+  }
+
+  spawn(x, y, z, vx, vy, vz, life, size, color, grow = 0) {
+    if (this.parts.length >= PARTICLE_MAX) this.parts.shift();
+    this.parts.push({ x, y, z, vx, vy, vz, life, max: life, size, color, grow });
+  }
+
+  dirt(x, z, heading, speed) {
+    const back = heading + Math.PI;
+    const spread = (Math.random() - 0.5) * 1.4;
+    const v = 30 + speed * 0.25;
+    const y = this.groundY(x, z);
+    this.spawn(
+      x + (Math.random() - 0.5) * 12, y + 3, z + (Math.random() - 0.5) * 12,
+      Math.cos(back + spread) * v, 40 + Math.random() * 50, Math.sin(back + spread) * v,
+      0.5 + Math.random() * 0.3, 3.5 + Math.random() * 4,
+      hex(TRACK.theme.groundAlt[Math.random() < 0.5 ? 0 : 1]), 14
+    );
+  }
+
+  flame(x, z, heading, tier) {
+    const back = heading + Math.PI;
+    const spread = (Math.random() - 0.5) * 0.5;
+    const v = 60 + Math.random() * 90;
+    const y = this.groundY(x, z);
+    this.spawn(
+      x + Math.cos(back) * CAR.LEN * 0.5, y + 6, z + Math.sin(back) * CAR.LEN * 0.5,
+      Math.cos(back + spread) * v, 12, Math.sin(back + spread) * v,
+      0.28 + Math.random() * 0.18, 4.5 + Math.random() * 5,
+      hex(Math.random() < 0.45 ? '#fff3c4' : (TIER_COLOR[tier] || '#ffab40')), -6
+    );
+  }
+
+  spark(x, z, heading, tier) {
+    const back = heading + Math.PI;
+    const spread = (Math.random() - 0.5) * 1.8;
+    const v = 70 + Math.random() * 120;
+    const y = this.groundY(x, z);
+    this.spawn(
+      x, y + 3, z,
+      Math.cos(back + spread) * v, 55 + Math.random() * 60, Math.sin(back + spread) * v,
+      0.18 + Math.random() * 0.16, 2.4 + Math.random() * 2.5,
+      hex(TIER_COLOR[tier] || '#ffffff'), -4
+    );
+  }
+
+  burst(x, z, tier) {
+    const y = this.groundY(x, z);
+    const color = hex(TIER_COLOR[tier] || '#ffffff');
+    for (let i = 0; i < 16; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const v = 60 + Math.random() * 170;
+      this.spawn(x, y + 6, z, Math.cos(a) * v, 60 + Math.random() * 90, Math.sin(a) * v,
+        0.3 + Math.random() * 0.25, 3.5 + Math.random() * 4, color, -5);
+    }
+  }
+
+  stepParticles(dt) {
+    const parts = this.parts;
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i];
+      p.life -= dt;
+      if (p.life <= 0) { parts.splice(i, 1); continue; }
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.z += p.vz * dt;
+      p.vx *= 1 - 2.6 * dt;
+      p.vz *= 1 - 2.6 * dt;
+      p.vy = p.vy * (1 - 2.0 * dt) - 120 * dt; // a little gravity
+      p.size = Math.max(0.5, p.size + p.grow * dt);
+    }
+  }
+
+  // ------------------------------------------------------------------ frame
+
+  draw(camX, camY, cars, now, opts = {}) {
     const gl = this.gl;
-    const cam = CAMERAS[camName] || CAMERAS.chase;
+    const dt = this.lastNow ? Math.min(0.05, (now - this.lastNow) / 1000) : 0.016;
+    this.lastNow = now;
+    this.stepParticles(dt);
+
+    const cam = CAMERAS[this.camName] || CAMERAS.sweep;
     const W = this.canvas.width, H = this.canvas.height;
     gl.viewport(0, 0, W, H);
 
     const placed = cars.map((c) => this.place(c));
-    const me = follow ? this.place(follow) : placed[0];
-    const dir = follow ? (follow.travel ?? follow.heading) : 0;
+    const follow = opts.follow || cars.find((c) => c.isMe) || cars[0];
+    if (!follow) return;
+    const me = this.place(follow);
+    // Aim down the direction of travel, not the nose: mid-drift you want to
+    // see where the car is going while it sits sideways in frame.
+    const dir = (follow.speed ?? 0) > 25 ? (follow.travel ?? follow.heading) : follow.heading;
     const fx = Math.cos(dir), fz = Math.sin(dir);
-    const eye = [
-      me.x - fx * cam.back,
-      me.y + cam.up,
-      me.z - fz * cam.back,
-    ];
-    const target = [me.x + fx * cam.lead, me.y + 10, me.z + fz * cam.lead];
-    const view = lookAt(eye, target);
+    const wantEye = [me.x - fx * cam.back, me.y + cam.up, me.z - fz * cam.back];
+    const wantTarget = [me.x + fx * cam.lead, me.y + 10, me.z + fz * cam.lead];
+
+    if (!this.cam) this.cam = { eye: wantEye.slice(), target: wantTarget.slice() };
+    const k = 1 - Math.exp(-CAM_LERP * dt);
+    for (let i = 0; i < 3; i++) {
+      this.cam.eye[i] += (wantEye[i] - this.cam.eye[i]) * k;
+      this.cam.target[i] += (wantTarget[i] - this.cam.target[i]) * k;
+    }
+
+    const eye = this.cam.eye.slice();
+    if (this.shake > 0.2) {
+      for (let i = 0; i < 3; i++) eye[i] += (Math.random() - 0.5) * this.shake;
+      this.shake *= Math.max(0, 1 - 7 * dt);
+    } else {
+      this.shake = 0;
+    }
+
+    const view = lookAt(eye, this.cam.target);
     const proj = perspective((cam.fov * Math.PI) / 180, W / H, 6, 6000);
     const viewProj = multiply(proj, view);
 
-    // Where the followed car lands on screen, for framing checks.
-    const cw = [me.x, me.y + 6, me.z, 1];
-    const clip = [0, 1, 3].map((r) =>
-      viewProj[r] * cw[0] + viewProj[4 + r] * cw[1] + viewProj[8 + r] * cw[2] + viewProj[12 + r]);
-    this.debug = { ndcX: clip[0] / clip[2], ndcY: clip[1] / clip[2] };
+    const toScreen = (x, y, z) => {
+      const clip = [0, 1, 3].map((r) =>
+        viewProj[r] * x + viewProj[4 + r] * y + viewProj[8 + r] * z + viewProj[12 + r]);
+      if (clip[2] <= 0) return null;
+      return {
+        x: (clip[0] / clip[2] * 0.5 + 0.5) * this.cssW,
+        y: (1 - (clip[1] / clip[2] * 0.5 + 0.5)) * this.cssH,
+      };
+    };
+    this.debug = toScreen(me.x, me.y + 6, me.z);
 
-    // Sky is a full-screen gradient behind everything: clear depth first, draw
-    // it with the depth test off, then let the world draw over it.
+    // Sky: clear depth, draw with the test off, then the world over the top.
     gl.clear(gl.DEPTH_BUFFER_BIT);
     gl.disable(gl.DEPTH_TEST);
     gl.useProgram(this.progSky.p);
@@ -519,8 +742,8 @@ export class Renderer3D {
     const common = (prog) => {
       gl.useProgram(prog.p);
       gl.uniformMatrix4fv(prog.u.uViewProj, false, viewProj);
-      gl.uniformMatrix4fv(prog.u.uModel, false, identity());
-      gl.uniform3fv(prog.u.uLight, [0.42, 0.83, -0.36]);
+      if (prog.u.uModel) gl.uniformMatrix4fv(prog.u.uModel, false, identity());
+      if (prog.u.uLight) gl.uniform3fv(prog.u.uLight, [0.42, 0.83, -0.36]);
       gl.uniform3fv(prog.u.uFog, this.colors.fog);
       gl.uniform1f(prog.u.uFogDensity, 0.00052);
       gl.uniform3fv(prog.u.uEye, eye);
@@ -538,11 +761,21 @@ export class Renderer3D {
     gl.bindVertexArray(this.road.vao);
     gl.drawElements(gl.TRIANGLES, this.road.count, this.road.type, 0);
 
-    // Shadows before the cars: blended, and they must not write depth or they
-    // would punch holes in the bodywork drawn on top of them.
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.depthMask(false);
+
+    // Skid marks lie on the road, under everything else.
+    const skidQuads = this.fillSkids(now);
+    if (skidQuads) {
+      common(this.progFx);
+      gl.bindVertexArray(this.fxVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.fxVbo);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.fxData, 0, skidQuads * 36);
+      gl.drawElements(gl.TRIANGLES, skidQuads * 6, gl.UNSIGNED_SHORT, 0);
+    }
+
+    // Contact shadows, then the cars over them.
     gl.useProgram(this.progShadow.p);
     gl.uniformMatrix4fv(this.progShadow.u.uViewProj, false, viewProj);
     gl.bindVertexArray(this.shadow.vao);
@@ -562,7 +795,95 @@ export class Renderer3D {
       gl.uniform3fv(this.progCar.u.uColor, hex(cars[i].color));
       gl.drawElements(gl.TRIANGLES, this.car.count, this.car.type, 0);
     });
+
+    // Particles last so flames and dirt sit over the bodywork.
+    const partQuads = this.fillParticles(eye, this.cam.target);
+    if (partQuads) {
+      gl.enable(gl.BLEND);
+      gl.depthMask(false);
+      common(this.progFx);
+      gl.bindVertexArray(this.fxVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.fxVbo);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.fxData, 0, partQuads * 36);
+      gl.drawElements(gl.TRIANGLES, partQuads * 6, gl.UNSIGNED_SHORT, 0);
+      gl.depthMask(true);
+      gl.disable(gl.BLEND);
+    }
     gl.bindVertexArray(null);
+
+    // Screen positions for the DOM name labels.
+    this.labels = [];
+    cars.forEach((c, i) => {
+      if (c.isMe || !c.name) return;
+      const s = toScreen(placed[i].x, placed[i].y + 26, placed[i].z);
+      if (s && s.x > -80 && s.x < this.cssW + 80 && s.y > -40 && s.y < this.cssH + 40) {
+        this.labels.push({ name: c.name, x: s.x, y: s.y });
+      }
+    });
+  }
+
+  // Pack skid segments into the quad buffer. Returns the quad count.
+  fillSkids(now) {
+    const marks = this.marks;
+    while (marks.length && now - marks[0].born > SKID_LIFE_MS) marks.shift();
+    const data = this.fxData;
+    let q = 0;
+    for (const m of marks) {
+      if (q >= SKID_MAX) break;
+      const dx = m.x2 - m.x1, dz = m.z2 - m.z1;
+      const len = Math.hypot(dx, dz) || 1;
+      const px = (-dz / len) * SKID_WIDTH, pz = (dx / len) * SKID_WIDTH;
+      const a = (1 - (now - m.born) / SKID_LIFE_MS) * m.s * 0.5;
+      const corners = [
+        [m.x1 - px, m.y1, m.z1 - pz], [m.x2 - px, m.y2, m.z2 - pz],
+        [m.x2 + px, m.y2, m.z2 + pz], [m.x1 + px, m.y1, m.z1 + pz],
+      ];
+      let o = q * 36;
+      for (const c of corners) {
+        data[o] = c[0]; data[o + 1] = c[1]; data[o + 2] = c[2];
+        data[o + 3] = 0.09; data[o + 4] = 0.08; data[o + 5] = 0.1;
+        data[o + 6] = Math.max(0, a);
+        data[o + 7] = 0; data[o + 8] = 0; // no radial falloff on rubber
+        o += 9;
+      }
+      q++;
+    }
+    return q;
+  }
+
+  // Camera-facing billboards for the particles.
+  fillParticles(eye, target) {
+    const fwd = [target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]];
+    const fl = Math.hypot(...fwd) || 1;
+    fwd[0] /= fl; fwd[1] /= fl; fwd[2] /= fl;
+    const right = [fwd[2], 0, -fwd[0]];
+    const rl = Math.hypot(...right) || 1;
+    right[0] /= rl; right[2] /= rl;
+    const up = [
+      right[1] * fwd[2] - right[2] * fwd[1],
+      right[2] * fwd[0] - right[0] * fwd[2],
+      right[0] * fwd[1] - right[1] * fwd[0],
+    ];
+    const data = this.fxData;
+    let q = 0;
+    for (const p of this.parts) {
+      if (q >= MAX_QUADS) break;
+      const s = p.size;
+      const a = Math.max(0, Math.min(1, p.life / p.max));
+      const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+      let o = q * 36;
+      for (const [cx, cy] of corners) {
+        data[o] = p.x + (right[0] * cx + up[0] * cy) * s;
+        data[o + 1] = p.y + (right[1] * cx + up[1] * cy) * s;
+        data[o + 2] = p.z + (right[2] * cx + up[2] * cy) * s;
+        data[o + 3] = p.color[0]; data[o + 4] = p.color[1]; data[o + 5] = p.color[2];
+        data[o + 6] = a;
+        data[o + 7] = cx; data[o + 8] = cy;
+        o += 9;
+      }
+      q++;
+    }
+    return q;
   }
 
   // Drop a car onto the surface, leaning with the camber and pitching on hills.

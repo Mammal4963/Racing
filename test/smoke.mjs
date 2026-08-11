@@ -178,6 +178,31 @@ if (peakCharge <= 0) fail('braking into a turn never charged the boost meter');
 if (barAtPeak === '0%') fail('boost meter charged but the HUD bar stayed empty');
 ok(`drifting charges the boost meter (peak ${peakCharge.toFixed(2)}, bar ${barAtPeak})`);
 
+// --- 3D view: switching mid-race must not disturb the race underneath.
+// Skipped rather than failed where the browser has no WebGL2 at all.
+await p1.click('#viewBtn');
+await p1.waitForTimeout(700);
+const view3d = await p1.evaluate(() => ({
+  view: window.__game.view,
+  canvasShown: !document.getElementById('game3d').classList.contains('hidden'),
+}));
+if (view3d.view === '2d') {
+  ok('3D view unavailable in this browser — skipped (game stayed on 2D)');
+} else {
+  if (!view3d.canvasShown) fail(`3D view active but its canvas is hidden: ${JSON.stringify(view3d)}`);
+  const before = await p1.evaluate(() => window.__game.race.lapDist);
+  await p1.waitForTimeout(700);
+  const after = await p1.evaluate(() => window.__game.race.lapDist);
+  if (after === before) fail('the race stopped advancing while in the 3D view');
+  ok(`3D view (${view3d.view}) renders and the race keeps running`);
+  for (let i = 0; i < 6 && (await p1.evaluate(() => window.__game.view)) !== '2d'; i++) {
+    await p1.click('#viewBtn');
+  }
+  if ((await p1.evaluate(() => window.__game.view)) !== '2d') fail('could not cycle back to 2D');
+  if (await p1.$eval('#game', (el) => el.classList.contains('hidden'))) fail('2D canvas still hidden');
+  ok('cycles back round to the 2D view');
+}
+
 // --- Reconnect: drop p2's socket mid-race. It should climb back into the same
 // car (same id, same lap) instead of dead-ending on the disconnect screen.
 const p2id = await p2.evaluate(() => window.__game.myId);

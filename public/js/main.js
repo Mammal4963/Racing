@@ -4,6 +4,7 @@ import {
 import { createCar, stepCar, angleDelta, driftTier, TIER_COLOR } from './car.js';
 import { Net } from './net.js';
 import { Renderer, PALETTE } from './render.js';
+import { Renderer3D } from './render3d.js';
 import { Sound } from './audio.js';
 
 const LAPS = 3;
@@ -46,6 +47,7 @@ const G = {
   setup: { track: 0, rounds: 1 },
   lastPos: 0,
   cam: { x: 0, y: 0 },
+  view: '2d', // 2d | chase | raised | sweep | high
 };
 
 const input = { steer: 0, brake: false };
@@ -744,8 +746,58 @@ function renderResults() {
 
 // --------------------------------------------------------------------- loop
 
+// Two renderers over the same game state. The 2D one is the default and
+// always works; the 3D one is built on first use so a WebGL failure can never
+// take the game down with it.
 const canvas = $('game');
-const renderer = new Renderer(canvas);
+const canvas3d = $('game3d');
+const renderer2d = new Renderer(canvas);
+let renderer3d = null;
+let renderer = renderer2d;
+
+const VIEWS = ['2d', 'chase', 'raised', 'sweep', 'high'];
+
+function setView(name) {
+  if (!VIEWS.includes(name)) name = '2d';
+  if (name !== '2d' && !renderer3d) {
+    try {
+      renderer3d = new Renderer3D(canvas3d);
+    } catch (e) {
+      toast('3D UNAVAILABLE', '#ff5252', 1600);
+      name = '2d';
+    }
+  }
+  G.view = name;
+  localStorage.setItem('racer-view', name);
+  const is3d = name !== '2d';
+  renderer = is3d ? renderer3d : renderer2d;
+  if (is3d) renderer.setCamera(name);
+  canvas.classList.toggle('hidden', is3d);
+  canvas3d.classList.toggle('hidden', !is3d);
+  $('labels3d').classList.toggle('hidden', !is3d);
+  if (!is3d) $('labels3d').innerHTML = '';
+  renderer.resize();
+  renderer.useTrack();
+  renderer.clearSkids();
+  const btn = $('viewBtn');
+  btn.textContent = `VIEW: ${is3d ? name.toUpperCase() : '2D'}`;
+  btn.classList.toggle('on3d', is3d);
+}
+
+// Project the 3D renderer's label positions onto pooled DOM nodes.
+function syncLabels() {
+  const box = $('labels3d');
+  const list = renderer === renderer3d ? renderer.labels || [] : [];
+  while (box.children.length < list.length) box.append(document.createElement('div'));
+  [...box.children].forEach((el, i) => {
+    const l = list[i];
+    if (!l) { el.style.display = 'none'; return; }
+    el.style.display = 'block';
+    el.textContent = l.name;
+    el.style.transform = `translate(-50%, -100%) translate(${l.x}px, ${l.y}px)`;
+  });
+}
+
 window.addEventListener('resize', () => renderer.resize());
 
 let lastFrame = performance.now();
@@ -797,7 +849,10 @@ function frame(now) {
   const k = 1 - Math.exp(-CAM_SMOOTH * dt);
   G.cam.x += (targetX - G.cam.x) * k;
   G.cam.y += (targetY - G.cam.y) * k;
-  renderer.draw(G.cam.x, G.cam.y, cars, now, { speedRatio });
+  // The 2D renderer uses the smoothed look-at point; the 3D one builds its own
+  // camera from the car being followed and ignores it.
+  renderer.draw(G.cam.x, G.cam.y, cars, now, { speedRatio, follow });
+  if (renderer === renderer3d) syncLabels();
 
   if (now - lastStandings > 500) {
     lastStandings = now;
@@ -859,6 +914,7 @@ function mergeInput() {
 
 window.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT') return;
+  if (e.code === 'KeyC') { cycleView(); return; } // quick camera swap while testing
   if ([...KEY_LEFT, ...KEY_RIGHT, ...KEY_BRAKE].includes(e.code)) e.preventDefault();
   keys.add(e.code);
   updateKeyInput();
@@ -911,6 +967,12 @@ $('soundBtn').addEventListener('click', () => {
   sound.setEnabled(!sound.on);
   syncSoundBtn();
 });
+
+function cycleView() {
+  setView(VIEWS[(VIEWS.indexOf(G.view) + 1) % VIEWS.length]);
+}
+$('viewBtn').addEventListener('click', cycleView);
+setView(localStorage.getItem('racer-view') || '2d');
 
 $('createBtn').addEventListener('click', () => {
   sound.unlock();
