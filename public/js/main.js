@@ -948,8 +948,15 @@ function readTouches(touches) {
   $('zoneL').classList.toggle('drift', sides.brake);
   $('zoneR').classList.toggle('drift', sides.brake);
 }
+// Touch listens on its own full-screen surface rather than on a canvas. The
+// visible canvas changes when the view is switched, and a listener bound to
+// one of them leaves the other view with no controls at all.
+const touchSurface = $('touch');
 for (const ev of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) {
-  canvas.addEventListener(ev, (e) => { e.preventDefault(); readTouches(e.touches); }, { passive: false });
+  touchSurface.addEventListener(ev, (e) => {
+    e.preventDefault();
+    readTouches(e.touches);
+  }, { passive: false });
 }
 
 // ----------------------------------------------------------------------- UI

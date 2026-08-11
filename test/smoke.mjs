@@ -101,16 +101,16 @@ const h2 = await p1.evaluate(() => window.__game.race.car.heading);
 await p1.evaluate(() => {
   // simulate a held touch in the right steering zone via the same handler path
   const ev = new TouchEvent('touchstart', {
-    touches: [new Touch({ identifier: 1, target: document.getElementById('game'), clientX: window.innerWidth * 0.9, clientY: 700 })],
+    touches: [new Touch({ identifier: 1, target: document.getElementById('touch'), clientX: window.innerWidth * 0.9, clientY: 700 })],
     bubbles: true, cancelable: true,
   });
-  document.getElementById('game').dispatchEvent(ev);
+  document.getElementById('touch').dispatchEvent(ev);
 });
 await p1.waitForTimeout(400);
 const h3 = await p1.evaluate(() => window.__game.race.car.heading);
 await p1.evaluate(() => {
   const ev = new TouchEvent('touchend', { touches: [], bubbles: true, cancelable: true });
-  document.getElementById('game').dispatchEvent(ev);
+  document.getElementById('touch').dispatchEvent(ev);
 });
 if (h3 - h2 < 0.1) fail(`touch steer had no effect (dh=${(h3 - h2).toFixed(3)})`);
 ok(`touch steering works (dh=${(h3 - h2).toFixed(2)} rad)`);
@@ -118,7 +118,7 @@ ok(`touch steering works (dh=${(h3 - h2).toFixed(2)} rad)`);
 // --- Touch drift gesture: holding the far side while steering should brake
 // and keep steering the way you already were, not cancel the turn.
 const touchAt = (ids) => `
-  const el = document.getElementById('game');
+  const el = document.getElementById('touch');
   const t = ${JSON.stringify(ids)}.map(([id, fx]) =>
     new Touch({ identifier: id, target: el, clientX: window.innerWidth * fx, clientY: 700 }));
   el.dispatchEvent(new TouchEvent('touchstart', { touches: t, bubbles: true, cancelable: true }));
@@ -140,14 +140,14 @@ if (bothSides.lit !== 2) fail(`expected both zones lit for the drift, got ${both
 ok('far-side touch brakes and drifts in the direction already steered');
 
 // Both grabbed at once from neutral is a straight-line stop, not a drift.
-await p1.evaluate(() => document.getElementById('game')
+await p1.evaluate(() => document.getElementById('touch')
   .dispatchEvent(new TouchEvent('touchend', { touches: [], bubbles: true, cancelable: true })));
 await p1.evaluate(new Function(touchAt([[1, 0.85], [2, 0.15]])));
 await p1.waitForTimeout(60);
 const together = await p1.evaluate(() => ({ ...window.__input }));
 if (!together.brake || together.steer !== 0) fail(`both at once should brake straight: ${JSON.stringify(together)}`);
 ok('both sides grabbed together brakes in a straight line');
-await p1.evaluate(() => document.getElementById('game')
+await p1.evaluate(() => document.getElementById('touch')
   .dispatchEvent(new TouchEvent('touchend', { touches: [], bubbles: true, cancelable: true })));
 
 // --- Drifting: braking while steering should charge the boost meter, and the
@@ -195,6 +195,15 @@ if (view3d.view === '2d') {
   const after = await p1.evaluate(() => window.__game.race.lapDist);
   if (after === before) fail('the race stopped advancing while in the 3D view');
   ok(`3D view (${view3d.view}) renders and the race keeps running`);
+
+  // Touch must keep working when the visible canvas changes underneath it.
+  await p1.evaluate(new Function(touchAt([[7, 0.85]])));
+  await p1.waitForTimeout(80);
+  const touch3d = await p1.evaluate(() => ({ ...window.__input }));
+  await p1.evaluate(() => document.getElementById('touch')
+    .dispatchEvent(new TouchEvent('touchend', { touches: [], bubbles: true, cancelable: true })));
+  if (touch3d.steer !== 1) fail(`touch does not reach the 3D view: ${JSON.stringify(touch3d)}`);
+  ok('touch steering still works in the 3D view');
   for (let i = 0; i < 6 && (await p1.evaluate(() => window.__game.view)) !== '2d'; i++) {
     await p1.click('#viewBtn');
   }

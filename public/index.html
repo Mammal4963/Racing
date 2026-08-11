@@ -14,8 +14,16 @@
     touch-action: none; -webkit-user-select: none; user-select: none;
     overscroll-behavior: none;
   }
-  #game, #game3d { position: fixed; inset: 0; width: 100vw; height: 100dvh; display: block; }
+  #game, #game3d {
+    position: fixed; inset: 0; width: 100vw; height: 100dvh; display: block;
+    touch-action: none;
+  }
   .hidden { display: none !important; }
+
+  /* The steering surface. Sits above the canvases and below the HUD (which is
+     pointer-events: none) and the buttons, so which canvas is on screen makes
+     no difference to the controls. */
+  #touch { position: fixed; inset: 0; z-index: 3; touch-action: none; }
 
   /* Name tags for the 3D view — projected to screen and positioned here,
      because drawing text in WebGL is not worth it for six labels. */
@@ -216,6 +224,7 @@
 <body>
 <canvas id="game"></canvas>
 <canvas id="game3d" class="hidden"></canvas>
+<div id="touch"></div>
 <div id="labels3d"></div>
 
 <div id="hud" class="hidden">
