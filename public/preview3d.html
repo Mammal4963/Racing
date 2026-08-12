@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Slipstream — 3D preview</title>
+<style>
+  html, body { margin: 0; height: 100dvh; overflow: hidden; background: #000; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100dvh; display: block; }
+  #tag {
+    position: fixed; left: 0; right: 0; bottom: 0; padding: 9px 12px;
+    text-align: center; font: 600 12px system-ui, sans-serif; color: #fff;
+    background: rgba(0,0,0,0.5); letter-spacing: 1.5px; text-transform: uppercase;
+  }
+  #err {
+    position: fixed; inset: 0; padding: 20px; color: #ff8080; background: #180a0a;
+    font: 12px ui-monospace, monospace; white-space: pre-wrap; overflow: auto;
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="tag"></div>
+<script type="module">
+import { TRACK, setTrack, pointAt } from '/js/track.js';
+import { Renderer3D, CAMERAS } from '/js/render3d.js';
+
+const q = new URLSearchParams(location.search);
+const trackIx = Number(q.get('track') ?? 0);
+const camName = q.get('cam') ?? 'chase';
+const heightScale = q.get('h') === '0' ? 0 : Number(q.get('h') ?? 1);
+
+// Park the pack at the tightest corner — that's where a camera choice either
+// works or doesn't.
+function tightestS() {
+  const { pts, cum } = TRACK;
+  const m = pts.length;
+  let best = Infinity, bestS = 0;
+  for (let i = 0; i < m; i++) {
+    const a = pts[(i - 3 + m) % m], b = pts[i], c = pts[(i + 3) % m];
+    const A = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const B = Math.hypot(c[0] - b[0], c[1] - b[1]);
+    const C = Math.hypot(c[0] - a[0], c[1] - a[1]);
+    const area = Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) / 2;
+    const r = area < 1e-6 ? Infinity : (A * B * C) / (4 * area);
+    if (r < best) { best = r; bestS = cum[i]; }
+  }
+  return bestS;
+}
+
+// A believable moment mid-race: you third, sideways, with traffic either side.
+const PACK = [
+  { ds: -170, off: -20, color: '#b388ff' },
+  { ds: -85, off: 18, color: '#69f0ae' },
+  { ds: 0, off: -10, color: '#ff5252', me: true, slip: 0.5 },
+  { ds: 88, off: 22, color: '#ffd740', slip: 0.3 },
+  { ds: 175, off: -16, color: '#40c4ff' },
+];
+
+try {
+  setTrack(trackIx);
+  const canvas = document.getElementById('gl');
+  const renderer = new Renderer3D(canvas);
+  renderer.resize();
+  renderer.useTrack(heightScale);
+
+  const anchor = Number(q.get('s') ?? tightestS());
+  const cars = PACK.map((c) => {
+    const p = pointAt(anchor + c.ds);
+    const nx = -Math.sin(p.ang), ny = Math.cos(p.ang);
+    return {
+      x: p.x + nx * c.off,
+      y: p.y + ny * c.off,
+      heading: p.ang + (c.slip || 0),
+      travel: p.ang,
+      color: c.color,
+      isMe: !!c.me,
+    };
+  });
+  const me = cars.find((c) => c.isMe);
+
+  const cam = CAMERAS[camName] || CAMERAS.chase;
+  // Let the harness override the rig so framing can be swept from outside.
+  for (const key of ['back', 'up', 'lead', 'fov']) {
+    if (q.has(key)) cam[key] = Number(q.get(key));
+  }
+  document.getElementById('tag').textContent =
+    `${TRACK.name} · ${cam.label} · ${heightScale ? 'elevation + banking' : 'flat'}`;
+
+  requestAnimationFrame(() => {
+    renderer.draw(cars, me, camName);
+    window.__debug = renderer.debug;
+    window.__stats = {
+      terrainTris: renderer.terrain.count / 3,
+      roadTris: renderer.road.count / 3,
+      carTris: renderer.car.count / 3,
+      cars: cars.length,
+    };
+    // Honest timing: draw on real animation frames and read a pixel back each
+    // frame, which forces the driver to actually finish the work.
+    window.__bench = (ms) => new Promise((done) => {
+      const px = new Uint8Array(4);
+      let frames = 0;
+      const t0 = performance.now();
+      const tick = () => {
+        renderer.draw(cars, me, camName);
+        renderer.gl.readPixels(1, 1, 1, 1, renderer.gl.RGBA, renderer.gl.UNSIGNED_BYTE, px);
+        frames++;
+        if (performance.now() - t0 < ms) requestAnimationFrame(tick);
+        else done({ fps: frames / ((performance.now() - t0) / 1000), frames });
+      };
+      requestAnimationFrame(tick);
+    });
+    window.__ready = true;
+  });
+} catch (e) {
+  const pre = document.createElement('div');
+  pre.id = 'err';
+  pre.textContent = String(e && e.stack || e);
+  document.body.append(pre);
+  window.__ready = true;
+  window.__error = String(e && e.message || e);
+}
+</script>
+</body>
+</html>

@@ -8,8 +8,11 @@
 
 const MAX_PLAYERS = 8;
 const FINISH_CUTOFF_MS = 45_000; // once someone finishes, others get this long
-const COUNTDOWN_MS = 3_800;
+const COUNTDOWN_MS = 3_600; // two red lights, a pause, then green
 const RESUME_GRACE_MS = 25_000; // a dropped phone can reclaim its car for this long
+const TRACK_COUNT = 4; // keep in step with LAYOUTS in public/js/track.js
+const ROUND_CHOICES = [1, 3, 5];
+const POINTS = [10, 8, 6, 5, 4, 3, 2, 1]; // championship points by finishing place
 
 const finite = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 const cleanName = (v) => String(v ?? '').slice(0, 12).trim() || 'Racer';
@@ -43,6 +46,9 @@ export class Room {
     this.gone = new Map(); // id -> {meta, at} — dropped, still inside the grace window
     this.cutoffAt = 0;
     this.nextOrder = 0;
+    this.setup = { track: 0, rounds: 1 }; // what the host has queued up
+    this.track = 0; // circuit the current race is on
+    this.series = null; // {rounds, round, tracks, scores} for a championship
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}')
     );
@@ -63,6 +69,9 @@ export class Room {
       this.gone = new Map(s.gone ?? []);
       this.cutoffAt = s.cutoffAt ?? 0;
       this.nextOrder = Math.max(this.nextOrder, s.nextOrder ?? 0);
+      this.setup = s.setup ?? this.setup;
+      this.track = s.track ?? 0;
+      this.series = s.series ?? null;
     });
   }
 
@@ -82,6 +91,46 @@ export class Room {
       gone: [...this.gone],
       cutoffAt: this.cutoffAt,
       nextOrder: this.nextOrder,
+      setup: this.setup,
+      track: this.track,
+      series: this.series,
+    });
+  }
+
+  // Championship standings, or null for a one-off race.
+  seriesView() {
+    if (!this.series) return null;
+    const standings = Object.entries(this.series.scores)
+      .map(([id, s]) => ({ id, name: s.name, color: s.color, pts: s.pts }))
+      .sort((a, b) => b.pts - a.pts);
+    return {
+      round: this.series.round,
+      rounds: this.series.rounds,
+      standings,
+      complete: this.series.round >= this.series.rounds,
+    };
+  }
+
+  async beginRace() {
+    this.phase = 'racing';
+    this.laps = new Map();
+    this.finishes = [];
+    this.cutoffAt = 0;
+    this.track = this.series
+      ? this.series.tracks[this.series.round - 1]
+      : this.setup.track;
+    this.roster = this.sockets()
+      .map(([, m]) => m)
+      .sort((a, b) => a.order - b.order)
+      .map((m) => ({ id: m.id, name: m.name, color: m.color }));
+    await this.save();
+    await this.state.storage.deleteAlarm();
+    this.broadcast({
+      t: 'go',
+      startIn: COUNTDOWN_MS,
+      order: this.roster.map((r) => r.id),
+      track: this.track,
+      series: this.seriesView(),
     });
   }
 
@@ -143,23 +192,31 @@ export class Room {
     if (!meta) return; // everything below requires a joined player
 
     switch (msg.t) {
+      case 'setup': {
+        // Host queues up the next race so everyone in the lobby can see it.
+        if (meta.id !== this.host().id) return;
+        const track = Math.min(TRACK_COUNT - 1, Math.max(0, msg.track | 0));
+        const rounds = ROUND_CHOICES.includes(msg.rounds | 0) ? msg.rounds | 0 : 1;
+        this.setup = { track, rounds };
+        await this.save();
+        this.broadcast({ t: 'setup', ...this.setup });
+        break;
+      }
       case 'start': {
         if (this.phase !== 'lobby' && this.phase !== 'results') return;
         if (meta.id !== this.host().id) return;
-        this.phase = 'racing';
-        this.laps = new Map();
-        this.finishes = [];
-        this.cutoffAt = 0;
-        this.roster = this.sockets()
-          .map(([, m]) => m)
-          .sort((a, b) => a.order - b.order)
-          .map((m) => ({ id: m.id, name: m.name, color: m.color }));
-        await this.save();
-        this.broadcast({
-          t: 'go',
-          startIn: COUNTDOWN_MS,
-          order: this.roster.map((r) => r.id),
-        });
+        const { track, rounds } = this.setup;
+        // A championship visits a different circuit each round.
+        this.series =
+          rounds > 1
+            ? {
+                rounds,
+                round: 1,
+                tracks: Array.from({ length: rounds }, (_, i) => (track + i) % TRACK_COUNT),
+                scores: {},
+              }
+            : null;
+        await this.beginRace();
         break;
       }
       case 's': {
@@ -197,6 +254,14 @@ export class Room {
       case 'again': {
         if (this.phase !== 'results') return;
         if (meta.id !== this.host().id) return;
+        // Mid-championship this rolls straight into the next round; otherwise
+        // it drops everyone back to the lobby to pick something new.
+        if (this.series && this.series.round < this.series.rounds) {
+          this.series.round++;
+          await this.beginRace();
+          break;
+        }
+        this.series = null;
         this.phase = 'lobby';
         this.roster = [];
         this.laps = new Map();
@@ -260,6 +325,9 @@ export class Room {
         hostId: this.host().id,
         players: this.sockets().map(([, m]) => Room.pub(m)),
         racers: this.roster.map((r) => r.id),
+        track: this.track,
+        setup: this.setup,
+        series: this.seriesView(),
       })
     );
     // Re-announce a resuming player with the lap they were on, so everyone
@@ -378,9 +446,20 @@ export class Room {
       .sort((a, b) => a.ms - b.ms)
       .concat(dnf)
       .map((row) => ({ ...row, ...byId.get(row.id) }));
+    // Championship points go to finishers only — retiring scores nothing.
+    if (this.series) {
+      list.forEach((row, i) => {
+        if (row.ms == null) return;
+        const scores = this.series.scores;
+        if (!scores[row.id]) scores[row.id] = { name: row.name, color: row.color, pts: 0 };
+        scores[row.id].name = row.name ?? scores[row.id].name;
+        scores[row.id].color = row.color ?? scores[row.id].color;
+        scores[row.id].pts += POINTS[i] || 0;
+      });
+    }
     this.cutoffAt = 0;
     await this.save();
-    this.broadcast({ t: 'results', list });
+    this.broadcast({ t: 'results', list, series: this.seriesView(), track: this.track });
     await this.state.storage.deleteAlarm();
   }
 }
