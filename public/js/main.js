@@ -80,8 +80,12 @@ function toast(text, color = '#ffd740', ms = 950) {
   toastTimer = setTimeout(() => el.classList.remove('show'), ms);
 }
 
-const pbKey = (track) => `pb-track-${track}`;
-const personalBest = (track) => Number(localStorage.getItem(pbKey(track))) || 0;
+// Two records per circuit: the full race (all three laps, the headline number)
+// and the single best lap.
+const pbLapKey = (track) => `pb-track-${track}`;
+const pbRaceKey = (track) => `pb-race-${track}`;
+const personalBest = (track) => Number(localStorage.getItem(pbLapKey(track))) || 0;
+const personalBestRace = (track) => Number(localStorage.getItem(pbRaceKey(track))) || 0;
 
 function useTrack(index) {
   if (TRACK.index === index) return;
@@ -286,7 +290,7 @@ function buildPickers() {
     b.innerHTML =
       `${escapeHtml(trackInfo(i).name)}` +
       `<small>${escapeHtml(trackInfo(i).blurb)}</small>` +
-      `<b class="pb"></b>`;
+      `<b class="pb"></b><i class="pblap"></i>`;
     b.addEventListener('click', () => sendSetup({ track: i }));
     tp.append(b);
   }
@@ -317,11 +321,14 @@ function renderSetup() {
   for (const b of $('trackPick').children) {
     const i = Number(b.dataset.track);
     b.classList.toggle('on', i === G.setup.track);
-    // Your own best lap is the reason to come back to a circuit.
-    const pb = personalBest(i);
+    // Your own times are the reason to come back to a circuit: the full race
+    // over three laps up front, your best single lap under it.
+    const race = personalBestRace(i);
+    const lap = personalBest(i);
     const el = b.querySelector('.pb');
-    el.textContent = pb ? fmtTime(pb) : '– : – –';
-    el.classList.toggle('none', !pb);
+    el.textContent = race ? fmtTime(race) : '– : – –';
+    el.classList.toggle('none', !race);
+    b.querySelector('.pblap').textContent = lap ? `best lap ${fmtTime(lap)}` : '';
   }
   for (const b of $('roundPick').children) {
     b.classList.toggle('on', Number(b.dataset.rounds) === G.setup.rounds);
@@ -508,7 +515,7 @@ function completeLap(race, now) {
   }
   const pb = personalBest(TRACK.index);
   if (!pb || lapMs < pb) {
-    localStorage.setItem(pbKey(TRACK.index), String(lapMs));
+    localStorage.setItem(pbLapKey(TRACK.index), String(lapMs));
     if (pb) {
       toast('TRACK RECORD', '#ffd740', 1300);
       sound.best();
@@ -526,6 +533,12 @@ function completeLap(race, now) {
     race.finished = true;
     race.finishMs = Math.round(now - race.startAt);
     G.net.send({ t: 'finish', ms: race.finishMs, best: race.bestLap });
+    // Best time for the whole race, which is what the circuit picker leads on.
+    const prevRace = personalBestRace(TRACK.index);
+    if (!prevRace || race.finishMs < prevRace) {
+      localStorage.setItem(pbRaceKey(TRACK.index), String(race.finishMs));
+      if (prevRace) toast('TRACK RECORD', '#ffd740', 1600);
+    }
     $('banner').textContent = `Finished — ${fmtTime(race.finishMs)}`;
     $('banner').classList.remove('hidden');
     sound.flag(G.lastPos === 1);

@@ -337,20 +337,33 @@ await p1.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
 await p2.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
 ok('race again returns both clients to lobby');
 
-// --- The circuit picker should now be showing a best lap for the track we
-// just raced, and nothing but a placeholder for the ones we haven't.
+// --- The circuit picker leads on the best time for the whole race, with the
+// best single lap under it, and a placeholder where nothing has been set.
 const raced = await p1.evaluate(() => window.__game.setup.track);
 const chips = await p1.$$eval('#trackPick .pick', (els) =>
-  els.map((el) => ({ track: Number(el.dataset.track), pb: el.querySelector('.pb').textContent.trim(), unset: el.querySelector('.pb').classList.contains('none') })));
+  els.map((el) => ({
+    track: Number(el.dataset.track),
+    race: el.querySelector('.pb').textContent.trim(),
+    lap: el.querySelector('.pblap').textContent.trim(),
+    unset: el.querySelector('.pb').classList.contains('none'),
+  })));
 if (chips.length !== 4) fail(`expected 4 circuit chips, got ${chips.length}`);
 const racedChip = chips.find((c) => c.track === raced);
-if (racedChip.unset || !/^\d+:\d\d\.\d\d$/.test(racedChip.pb)) {
-  fail(`no best lap shown for the circuit just raced: ${JSON.stringify(racedChip)}`);
+if (racedChip.unset || !/^\d+:\d\d\.\d\d$/.test(racedChip.race)) {
+  fail(`no race time shown for the circuit just raced: ${JSON.stringify(racedChip)}`);
+}
+if (!/^best lap \d+:\d\d\.\d\d$/.test(racedChip.lap)) {
+  fail(`no best lap under the race time: ${JSON.stringify(racedChip)}`);
+}
+// The whole race must be slower than any single lap of it.
+const toMs = (t) => { const [m, s] = t.replace(/[^\d:.]/g, '').split(':'); return (+m) * 60000 + (+s) * 1000; };
+if (toMs(racedChip.race) <= toMs(racedChip.lap)) {
+  fail(`race time should exceed a single lap: ${JSON.stringify(racedChip)}`);
 }
 if (!chips.some((c) => c.track !== raced && c.unset)) {
   fail(`unraced circuits should show a placeholder: ${JSON.stringify(chips)}`);
 }
-ok(`circuit picker shows best laps (${chips.map((c) => c.pb).join(' | ')})`);
+ok(`circuit picker shows race times (${chips.map((c) => c.race).join(' | ')}), ${racedChip.lap}`);
 
 // A non-host sees the times too, but can't change the selection.
 const guest = await p2.evaluate(() => ({
