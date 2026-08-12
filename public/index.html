@@ -84,8 +84,20 @@
     border-radius: 10px; line-height: 1.25;
   }
   .pick small { display: block; font-size: 10px; color: #6f7789; font-weight: 500; }
+  .pick .pb {
+    display: block; margin-top: 3px; font-size: 13px; font-weight: 800;
+    color: #ffd740; font-variant-numeric: tabular-nums; letter-spacing: 0.5px;
+  }
+  .pick .pb.none { color: #4d5466; font-weight: 600; }
   .pick.on { background: #ffd740; color: #191505; border-color: #ffd740; }
   .pick.on small { color: #6b5a12; }
+  .pick.on .pb { color: #191505; }
+  .pick.on .pb.none { color: #8a7526; }
+  /* Non-hosts see the choice but cannot change it. */
+  #setupBox.readonly .pickRow { pointer-events: none; }
+  /* Dimmed enough to read as not-selectable, not so much that the times
+     stop being readable — showing them is the point. */
+  #setupBox.readonly .pick:not(.on) { opacity: 0.7; }
   #setupInfo { font-size: 14px; }
   #setupInfo b { color: #ffd740; }
 
@@ -268,13 +280,12 @@
   <div id="roomCode"></div>
   <button id="shareBtn" class="secondary">Share link</button>
   <ul id="playerList"></ul>
-  <div id="setupBox" class="hidden">
-    <div class="pickLabel">circuit</div>
+  <div id="setupBox">
+    <div class="pickLabel">circuit · your best lap</div>
     <div class="pickRow" id="trackPick"></div>
-    <div class="pickLabel">length</div>
+    <div class="pickLabel" id="lengthLabel">length</div>
     <div class="pickRow" id="roundPick"></div>
   </div>
-  <div id="setupInfo" class="wait"></div>
   <button id="startBtn" class="hidden">Start race</button>
   <div id="waitMsg" class="wait">Waiting for the host to start…</div>
 </div>

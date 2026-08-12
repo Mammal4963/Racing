@@ -337,6 +337,37 @@ await p1.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
 await p2.waitForSelector('#lobby:not(.hidden)', { timeout: 5000 });
 ok('race again returns both clients to lobby');
 
+// --- The circuit picker should now be showing a best lap for the track we
+// just raced, and nothing but a placeholder for the ones we haven't.
+const raced = await p1.evaluate(() => window.__game.setup.track);
+const chips = await p1.$$eval('#trackPick .pick', (els) =>
+  els.map((el) => ({ track: Number(el.dataset.track), pb: el.querySelector('.pb').textContent.trim(), unset: el.querySelector('.pb').classList.contains('none') })));
+if (chips.length !== 4) fail(`expected 4 circuit chips, got ${chips.length}`);
+const racedChip = chips.find((c) => c.track === raced);
+if (racedChip.unset || !/^\d+:\d\d\.\d\d$/.test(racedChip.pb)) {
+  fail(`no best lap shown for the circuit just raced: ${JSON.stringify(racedChip)}`);
+}
+if (!chips.some((c) => c.track !== raced && c.unset)) {
+  fail(`unraced circuits should show a placeholder: ${JSON.stringify(chips)}`);
+}
+ok(`circuit picker shows best laps (${chips.map((c) => c.pb).join(' | ')})`);
+
+// A non-host sees the times too, but can't change the selection.
+const guest = await p2.evaluate(() => ({
+  boxShown: !document.getElementById('setupBox').classList.contains('hidden'),
+  readonly: document.getElementById('setupBox').classList.contains('readonly'),
+  chips: document.querySelectorAll('#trackPick .pb').length,
+}));
+if (!guest.boxShown || guest.chips !== 4) fail(`non-host cannot see the circuits: ${JSON.stringify(guest)}`);
+if (!guest.readonly) fail('non-host got an editable circuit picker');
+const guestTrackBefore = await p2.evaluate(() => window.__game.setup.track);
+await p2.evaluate(() => document.querySelector('#trackPick .pick:nth-child(4)').click());
+await p2.waitForTimeout(150);
+if (await p2.evaluate(() => window.__game.setup.track) !== guestTrackBefore) {
+  fail('a non-host managed to change the circuit');
+}
+ok('non-host sees the circuit times but cannot change the pick');
+
 // --- Championship: points, standings, and a new circuit each round.
 await p1.click('#roundPick .pick:nth-child(2)'); // 3 rounds
 await p2.waitForFunction(() => window.__game.setup.rounds === 3, null, { timeout: 5000 });

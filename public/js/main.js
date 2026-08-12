@@ -283,7 +283,10 @@ function buildPickers() {
     const b = document.createElement('button');
     b.className = 'pick';
     b.dataset.track = String(i);
-    b.innerHTML = `${escapeHtml(trackInfo(i).name)}<small></small>`;
+    b.innerHTML =
+      `${escapeHtml(trackInfo(i).name)}` +
+      `<small>${escapeHtml(trackInfo(i).blurb)}</small>` +
+      `<b class="pb"></b>`;
     b.addEventListener('click', () => sendSetup({ track: i }));
     tp.append(b);
   }
@@ -299,6 +302,9 @@ function buildPickers() {
 }
 
 function sendSetup(patch) {
+  // The room rejects setup from anyone but the host, so don't let a non-host
+  // change its own copy and drift out of step with everyone else.
+  if (G.myId !== G.hostId) return;
   G.setup = { ...G.setup, ...patch };
   renderSetup();
   G.net?.send({ t: 'setup', ...G.setup });
@@ -306,21 +312,22 @@ function sendSetup(patch) {
 
 function renderSetup() {
   const isHost = G.myId === G.hostId;
-  $('setupBox').classList.toggle('hidden', !isHost);
+  // Everyone sees the circuits and their times; only the host can change them.
+  $('setupBox').classList.toggle('readonly', !isHost);
   for (const b of $('trackPick').children) {
     const i = Number(b.dataset.track);
     b.classList.toggle('on', i === G.setup.track);
     // Your own best lap is the reason to come back to a circuit.
     const pb = personalBest(i);
-    b.querySelector('small').textContent = pb ? `best ${fmtTime(pb)}` : trackInfo(i).blurb;
+    const el = b.querySelector('.pb');
+    el.textContent = pb ? fmtTime(pb) : '– : – –';
+    el.classList.toggle('none', !pb);
   }
   for (const b of $('roundPick').children) {
     b.classList.toggle('on', Number(b.dataset.rounds) === G.setup.rounds);
   }
   const t = trackInfo(G.setup.track);
-  const len = G.setup.rounds === 1 ? 'single race' : `${G.setup.rounds}-round championship`;
-  $('setupInfo').innerHTML = isHost ? '' : `<b>${escapeHtml(t.name)}</b> · ${len}`;
-  $('setupInfo').classList.toggle('hidden', isHost);
+  $('lengthLabel').textContent = isHost ? 'length' : 'length · host picks';
   $('startBtn').textContent =
     G.setup.rounds === 1 ? `Start race · ${t.name}` : `Start ${G.setup.rounds}-round championship`;
 }
